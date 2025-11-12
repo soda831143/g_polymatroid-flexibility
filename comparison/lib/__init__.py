@@ -43,3 +43,9 @@ from . import algo_Zonotope_l2
 from . import algo_Zonotope_Rel
 from . import algo_Zonotope
 from . import algo_Barot_Inner
+from . import algo_Inner_affine
+
+# G-Polymatroid坐标变换算法 (统一框架)
+from . import algo_g_polymatroid_transform_det  # 确定性版本
+from . import algo_g_polymatroid_jcc_sro        # SRO版本
+from . import algo_g_polymatroid_jcc_resro      # Re-SRO版本
