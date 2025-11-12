@@ -21,8 +21,9 @@ from comparison.lib import (
     algo_Zonotope, algo_Barot_Inner, algo_Inner_affine
 )
 from comparison.lib import (
-    algo_g_polymatroid_jcc_sro,      # JCC-SRO算法 (坐标变换)
-    algo_g_polymatroid_jcc_resro     # JCC-Re-SRO算法 (坐标变换)
+    algo_g_polymatroid_transform_det,  # 确定性坐标变换 (新框架)
+    algo_g_polymatroid_jcc_sro,        # JCC-SRO算法 (坐标变换)
+    algo_g_polymatroid_jcc_resro       # JCC-Re-SRO算法 (坐标变换)
 )
 
 # --- 依赖项导入 ---
@@ -125,8 +126,9 @@ ALGORITHMS = {
     'Zonotope': algo_Zonotope,
     'Barot Inner': algo_Barot_Inner,
     'Inner Affine': algo_Inner_affine,
-    'JCC-SRO': algo_g_polymatroid_jcc_sro,        # JCC-SRO (单阶段,坐标变换)
-    'JCC-Re-SRO': algo_g_polymatroid_jcc_resro    # JCC-Re-SRO (两阶段,坐标变换)
+    'G-Poly-Transform-Det': algo_g_polymatroid_transform_det,  # 确定性坐标变换 (新框架)
+    'JCC-SRO': algo_g_polymatroid_jcc_sro,                     # JCC-SRO (单阶段,坐标变换)
+    'JCC-Re-SRO': algo_g_polymatroid_jcc_resro                 # JCC-Re-SRO (两阶段,坐标变换)
 }
 
 # 需要不确定性数据的算法
