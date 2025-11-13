@@ -207,7 +207,7 @@ ALGORITHM_ENABLE = {
 # 需要不确定性数据的算法
 JCC_ALGOS = {'JCC-SRO', 'JCC-Re-SRO'}
 
-# 使用solve()接口而非algo()接口的算法 (包括所有g-polymatroid变换算法)
+# 使用solve()接口且支持指定优化目标的算法
 GPOLY_ALGOS = {'G-Poly-Transform-Det', 'JCC-SRO', 'JCC-Re-SRO'}
 
 def get_enabled_algorithms():
@@ -251,14 +251,30 @@ def print_algorithm_status():
     print("-" * 50)
 
 # --- 数据生成 ---
-def run_algorithm(algo_name, algo_module, data):
-    print(f"  运行算法: {algo_name}...")
+def run_algorithm(algo_name, algo_module, data, objective=None):
+    """
+    运行单个算法
+    
+    Args:
+        algo_name: 算法名称
+        algo_module: 算法模块
+        data: 输入数据
+        objective: 优化目标 ('cost' 或 'peak')，仅对G-Poly算法有效
+    
+    Returns:
+        结果字典
+    """
+    obj_suffix = f" ({objective})" if objective else ""
+    print(f"  运行算法: {algo_name}{obj_suffix}...")
     try:
         start_time = time.time()
         
-        # G-Polymatroid算法需要特殊处理,调用solve()而不是algo()
+        # G-Polymatroid算法需要特殊处理,调用solve()并指定优化目标
         if algo_name in GPOLY_ALGOS:
-            result = algo_module.solve(data)  # G-Poly算法使用solve()接口
+            if objective is None:
+                raise ValueError(f"{algo_name} 必须指定 objective 参数")
+            
+            result = algo_module.solve(data, objective=objective)
             total_time = time.time() - start_time
             cost = result.get('total_cost', np.nan)
             peak = result.get('peak_power', np.nan)
@@ -268,11 +284,11 @@ def run_algorithm(algo_name, algo_module, data):
             return {
                 'cost_value': cost, 'peak_value': peak,
                 'cost_time': comp_time, 'peak_time': comp_time,
-                'total_time': comp_time,  # 添加total_time字段
-                'algorithm': algo_name, 'result': result
+                'total_time': comp_time,
+                'algorithm': algo_name, 'objective': objective, 'result': result
             }
         else:
-            # 传统算法使用algo()接口
+            # 传统算法使用algo()接口（同时返回成本和峰值）
             result = algo_module.algo(data)
             total_time = time.time() - start_time
             cost = result.get('cost_value', np.nan)
@@ -282,37 +298,87 @@ def run_algorithm(algo_name, algo_module, data):
             print(f"    完成: cost={cost:.3f} (t={cost_time:.3f}s), peak={peak:.3f} (t={peak_time:.3f}s)")
             return {
                 'cost_value': cost, 'peak_value': peak,
-            'cost_time': cost_time, 'peak_time': peak_time,
-            'algo_time': result.get('algo_time', total_time), 'total_time': total_time,
-            'status': 'success'
-        }
+                'cost_time': cost_time, 'peak_time': peak_time,
+                'algo_time': result.get('algo_time', total_time), 'total_time': total_time,
+                'status': 'success'
+            }
     except Exception as e:
         print(f"    错误: {e}")
+        import traceback
+        traceback.print_exc()
         return {'cost_value': np.nan, 'peak_value': np.nan, 'status': f'error: {e}', 'total_time': 0.0}
     
 # --- UPR计算和结果保存 ---
 def calculate_and_save_upr(df, algorithms, output_dir):
+    """
+    计算UPR并保存结果
+    
+    关键逻辑：
+    - 成本UPR：使用以"成本"为目标优化的结果
+    - 峰值UPR：使用以"峰值"为目标优化的结果
+    - 这样可以公平评估每个算法在各自目标上的表现
+    """
+    print("\n" + "="*60)
+    print("计算UPR (Unmet Performance Ratio)")
+    print("="*60)
+    
     for idx, row in df.iterrows():
-        exact_cost, exact_peak = row['Exact Minkowski_cost_value'], row['Exact Minkowski_peak_value']
-        noflex_cost, noflex_peak = row['No Flexibility_cost_value'], row['No Flexibility_peak_value']
+        # 基准值：Exact Minkowski 和 No Flexibility
+        exact_cost = row['Exact Minkowski_cost_value']
+        exact_peak = row['Exact Minkowski_peak_value']
+        noflex_cost = row['No Flexibility_cost_value']
+        noflex_peak = row['No Flexibility_peak_value']
+        
+        # 计算每个算法的UPR
         for algo in algorithms:
-            if algo in ['Exact Minkowski', 'No Flexibility']: continue
-            cost_upr = ((row[f'{algo}_cost_value'] - exact_cost) / (noflex_cost - exact_cost) * 100.0) if abs(noflex_cost - exact_cost) > 1e-6 else 0.0
-            peak_upr = ((row[f'{algo}_peak_value'] - exact_peak) / (noflex_peak - exact_peak) * 100.0) if abs(noflex_peak - exact_peak) > 1e-6 else 0.0
+            if algo in ['Exact Minkowski', 'No Flexibility']: 
+                continue
+            
+            # 成本UPR：使用以成本为目标的优化结果
+            algo_cost = row[f'{algo}_cost_value']
+            if abs(noflex_cost - exact_cost) > 1e-6:
+                cost_upr = ((algo_cost - exact_cost) / (noflex_cost - exact_cost) * 100.0)
+            else:
+                cost_upr = 0.0
             df.loc[idx, f'{algo}_cost_upr'] = cost_upr
+            
+            # 峰值UPR：使用以峰值为目标的优化结果
+            algo_peak = row[f'{algo}_peak_value']
+            if abs(noflex_peak - exact_peak) > 1e-6:
+                peak_upr = ((algo_peak - exact_peak) / (noflex_peak - exact_peak) * 100.0)
+            else:
+                peak_upr = 0.0
             df.loc[idx, f'{algo}_peak_upr'] = peak_upr
+    
+    # 计算平均UPR并显示
+    print("\n结果汇总:")
+    print(f"{'算法':<25} {'成本UPR (%)':<15} {'峰值UPR (%)':<15} {'总时间 (s)':<15}")
+    print("-" * 70)
+    
     summary = []
     for name in algorithms:
-        if name in ['Exact Minkowski', 'No Flexibility']: continue
+        if name in ['Exact Minkowski', 'No Flexibility']: 
+            continue
+        
         avg_cost_upr = df[f'{name}_cost_upr'].mean()
         avg_peak_upr = df[f'{name}_peak_upr'].mean()
         avg_time = df[f'{name}_total_time'].mean()
+        
         print(f"{name:<25} {avg_cost_upr:<15.2f} {avg_peak_upr:<15.2f} {avg_time:<15.3f}")
-        summary.append({'Algorithm': name, 'Cost_UPR': avg_cost_upr, 'Peak_UPR': avg_peak_upr, 'Time': avg_time})
+        summary.append({
+            'Algorithm': name, 
+            'Cost_UPR': avg_cost_upr, 
+            'Peak_UPR': avg_peak_upr, 
+            'Total_Time': avg_time
+        })
+    
+    # 保存结果
     os.makedirs(output_dir, exist_ok=True)
     df.to_csv(os.path.join(output_dir, "advanced_comparison_results.csv"), index=False)
     pd.DataFrame(summary).to_csv(os.path.join(output_dir, "advanced_summary.csv"), index=False)
-    print(f"\n详细结果和摘要已保存到 '{output_dir}' 目录。\n{'='*60}")
+    
+    print(f"\n详细结果和摘要已保存到 '{output_dir}' 目录。")
+    print("="*60)
 
 # --- 主流程 ---
 def run_advanced_comparison(num_samples, num_households, periods, num_days, num_tcls=None, t_horizon=None):
@@ -401,43 +467,68 @@ def run_advanced_comparison(num_samples, num_households, periods, num_days, num_
         for name, module in ALGORITHMS.items():
             run_data = data.copy()
             
+            # 准备不确定性数据（JCC算法需要）
             if name in JCC_ALGOS:
-                # JCC算法需要温度误差数据
                 if name == 'JCC-Re-SRO':
-                    # Re-SRO使用3部分独立数据 (1/4 + 1/4 + 1/2)
                     run_data['uncertainty_data'] = {
-                        'D_shape': omega_sro_shape,           # 25% for SRO shape
-                        'D_calib': omega_sro_calib,           # 25% for SRO calibration
-                        'D_resro_calib': omega_resro_calib,   # 50% for Re-SRO calibration (独立!)
+                        'D_shape': omega_sro_shape,
+                        'D_calib': omega_sro_calib,
+                        'D_resro_calib': omega_resro_calib,
                         'epsilon': 0.05,
                         'delta': 0.05,
                         'use_full_cov': True
                     }
                     print(f"  [{name}] 使用独立Re-SRO数据: SRO({omega_sro_shape.shape[0]}+{omega_sro_calib.shape[0]}) + Re-SRO({omega_resro_calib.shape[0]})")
                 else:
-                    # JCC-SRO使用2部分数据 (1/2 + 1/2)
                     run_data['uncertainty_data'] = {
-                        'D_shape': omega_shape_set,           # 50% for shape
-                        'D_calib': omega_calibration_set,     # 50% for calibration
+                        'D_shape': omega_shape_set,
+                        'D_calib': omega_calibration_set,
                         'epsilon': 0.05,
                         'delta': 0.05,
                         'use_full_cov': True
                     }
                     print(f"  [{name}] 使用SRO数据: shape({omega_shape_set.shape[0]}) + calib({omega_calibration_set.shape[0]})")
             
-            result = run_algorithm(name, module, run_data)
-            for key, value in result.items():
-                sample_results[f"{name}_{key}"] = value
+            # 对于G-Poly算法，需要分别运行成本和峰值优化
+            if name in GPOLY_ALGOS:
+                # 运行成本优化
+                print(f"\n  --- {name}: 成本优化 ---")
+                result_cost = run_algorithm(name, module, run_data, objective='cost')
+                
+                # 运行峰值优化
+                print(f"\n  --- {name}: 峰值优化 ---")
+                result_peak = run_algorithm(name, module, run_data, objective='peak')
+                
+                # 合并结果：成本值来自成本优化，峰值来自峰值优化
+                sample_results[f"{name}_cost_value"] = result_cost['cost_value']
+                sample_results[f"{name}_cost_time"] = result_cost['cost_time']
+                sample_results[f"{name}_peak_value"] = result_peak['peak_value']
+                sample_results[f"{name}_peak_time"] = result_peak['peak_time']
+                sample_results[f"{name}_total_time"] = result_cost['total_time'] + result_peak['total_time']
+                sample_results[f"{name}_status"] = 'success'
+                
+            else:
+                # 传统算法：一次运行同时得到成本和峰值
+                result = run_algorithm(name, module, run_data)
+                for key, value in result.items():
+                    sample_results[f"{name}_{key}"] = value
         
         all_results.append(sample_results)
     
     # 5. 计算并显示结果
     df = pd.DataFrame(all_results)
-    print("\n" + "=" * 60)
-    print("对比结果")
-    print("=" * 60)
-    print(f"{'算法':<25} {'成本UPR (%)':<15} {'峰值UPR (%)':<15} {'总时间 (s)':<15}")
-    print("-" * 70)
+    
+    print("\n" + "="*60)
+    print("原始结果预览")
+    print("="*60)
+    print("\n各算法的成本和峰值结果:")
+    for name in ALGORITHMS.keys():
+        if f'{name}_cost_value' in df.columns and f'{name}_peak_value' in df.columns:
+            avg_cost = df[f'{name}_cost_value'].mean()
+            avg_peak = df[f'{name}_peak_value'].mean()
+            avg_time = df[f'{name}_total_time'].mean()
+            print(f"  {name:<25} Cost={avg_cost:<10.2f} Peak={avg_peak:<10.2f} Time={avg_time:<8.3f}s")
+    
     calculate_and_save_upr(df, list(ALGORITHMS.keys()), "comparison_results")
 
 

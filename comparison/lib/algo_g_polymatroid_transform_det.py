@@ -22,58 +22,74 @@ if project_root not in sys.path:
 from flexitroid.aggregations.aggregator import Aggregator
 from flexitroid.devices.tcl import TCL
 from flexitroid.devices.general_der import GeneralDER, DERParameters
-from .peak_optimization import optimize_peak_l_infinity
+from .peak_optimization import optimize_cost_column_generation, optimize_peak_column_generation
+from .correct_tcl_gpoly import CorrectTCL_GPoly  # 【关键修正】使用正确的p/b实现
 
 
 def _solve_cost_optimization(aggregator, prices, P0_agg, T, tcl_objs):
     """
-    成本优化在虚拟聚合坐标中：保证物理最优
+    成本优化：使用列生成框架
     
-    关键修正：使用求和而非平均！
+    【正确的方法】：列生成（Dantzig-Wolfe分解）
     
-    物理成本（所有TCL相同电费）：
-        J = Σ_t c[t]·P[t] = Σ_t c[t]·(P0[t] + Σ_i u_i[t])
+    问题：异构坐标变换导致的目标函数耦合
+    - 物理成本：J = Σ_t c[t]·(P0[t] + Σ_i (γ_i[t]·ũ_i[t]))
+    - 可行集：ũ_agg = Σ_i ũ_i ∈ F_agg
+    - 问题：不存在只关于ũ_agg的"虚拟目标函数"
     
-    虚拟变换：u_i[t] = (a_i^t/δ_i)·ũ_i[t]
-    
-    虚拟聚合成本：
-        J = const + Σ_i Σ_t c[t]·(a_i^t/δ_i)·ũ_i[t]
-          = const + Σ_t c[t]·(Σ_i a_i^t/δ_i)·ũ_agg[t]
-    
-    因此虚拟聚合目标函数系数（关键！）：
-        c̃_agg[t] = c[t]·(Σ_i a_i^t/δ_i)  
-        
-    注意：是对所有i求和，不是平均！
+    解决方案：列生成迭代
+    1. 主问题：在F_agg的顶点凸组合上优化物理成本
+    2. 子问题：通过贪心算法生成改善顶点
+    3. 迭代直到收敛
     """
-    # 计算虚拟聚合目标系数：c̃_agg[t] = c[t]·Σ_i(a_i^t/δ_i)
-    N = len(tcl_objs) if tcl_objs else 1
-    c_virtual_agg = np.zeros(T)
+    u0_physical_individual, u0_physical_agg, total_cost = optimize_cost_column_generation(
+        aggregator, prices, P0_agg, tcl_objs, T
+    )
     
-    for t in range(T):
-        # 计算该时刻所有TCL的变换系数之和
-        scale_sum = 0
-        for i in range(N):
-            tcl = tcl_objs[i]
-            scale = (tcl.a ** t) / tcl.delta if tcl.delta > 1e-10 else 1.0
-            scale_sum += scale
-        
-        # 虚拟聚合目标系数 = 电费 × 变换系数之和
-        c_virtual_agg[t] = prices[t] * scale_sum
+    # 从物理个体信号反推虚拟个体信号（用于其他需要虚拟信号的地方）
+    N = len(tcl_objs)
+    u0_virtual_individual = np.zeros((N, T))
+    for i, tcl in enumerate(tcl_objs):
+        a_i = tcl.a
+        delta_i = tcl.delta
+        for t in range(T):
+            scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
+            u0_virtual_individual[i, t] = u0_physical_individual[i, t] / scale if abs(scale) > 1e-10 else 0.0
     
-    # 在虚拟聚合空间优化
-    u0_virtual_agg = aggregator.solve_linear_program(c_virtual_agg)
-    
-    # 分解为个体虚拟信号
-    u0_virtual_individual = aggregator.disaggregate(u0_virtual_agg)
+    # 虚拟聚合信号
+    u0_virtual_agg = np.sum(u0_virtual_individual, axis=0)
     
     return u0_virtual_individual, u0_virtual_agg
 
 
 def _solve_peak_optimization(aggregator, P0_agg, tcl_objs, T):
     """
-    峰值优化: 在虚拟坐标中求解L∞规划
+    峰值优化：使用列生成框架
+    
+    【正确的方法】：列生成（Dantzig-Wolfe分解）
+    
+    问题同成本优化，但目标函数是L-infinity
+    - 物理峰值：P_peak = max_t(P0[t] + Σ_i (γ_i[t]·ũ_i[t]))
+    - 可行集：ũ_agg = Σ_i ũ_i ∈ F_agg
+    - 同样需要列生成来保证物理最优
     """
-    return optimize_peak_l_infinity(aggregator, P0_agg, tcl_objs, T)
+    u0_physical_individual, u0_physical_agg, peak_value = optimize_peak_column_generation(
+        aggregator, P0_agg, tcl_objs, T
+    )
+    
+    # 从物理信号反推虚拟信号
+    N = len(tcl_objs)
+    u0_virtual_individual = np.zeros((N, T))
+    for i, tcl in enumerate(tcl_objs):
+        a_i = tcl.a
+        delta_i = tcl.delta
+        for t in range(T):
+            scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
+            u0_virtual_individual[i, t] = u0_physical_individual[i, t] / scale if abs(scale) > 1e-10 else 0.0
+    
+    u0_virtual_agg = np.sum(u0_virtual_individual, axis=0)
+    
+    return u0_virtual_individual, u0_virtual_agg
 
 
 def solve(data: dict, tcl_objs: List = None, objective='cost') -> dict:
@@ -157,94 +173,98 @@ def solve(data: dict, tcl_objs: List = None, objective='cost') -> dict:
             u_min_virt[t] = u_min_phys[t] * scale
             u_max_virt[t] = u_max_phys[t] * scale
         
-        # 虚拟累积能量边界 (关键修正!)
+        # 虚拟状态约束修正!
         # 物理: x(t) = a^t·x0 + δ·Σ_{s=0}^{t-1} a^{t-1-s}·u(s)
         # 虚拟: x̃(t) = x(t)/a^t = x0 + Σ_{s=0}^{t-1} ũ(s)
-        # 物理约束: -x_plus <= x(t) <= x_plus
-        # 虚拟约束: -x_plus/a^t <= x̃(t) <= x_plus/a^t
         # 
-        # 对于GeneralDER中的x_min[t], x_max[t] (表示Σ_{s=0}^{t} ũ(s)的范围):
-        # x̃(t+1) = x0 + Σ_{s=0}^{t} ũ(s)
-        # 所以: Σ_{s=0}^{t} ũ(s) = x̃(t+1) - x0
-        # 边界: -x_plus/a^(t+1) - x0 <= Σ_{s=0}^{t} ũ(s) <= x_plus/a^(t+1) - x0
+        # 物理约束: -x_plus <= x(t) <= x_plus (对所有t)
+        # ∴ 虚拟约束: -x_plus/a^t <= x̃(t) <= x_plus/a^t
+        # ∴ 累积约束: -x_plus/a^t - x0 <= Σ_{s=0}^{t-1} ũ(s) <= x_plus/a^t - x0
         #
-        # 关键: 状态约束通常比功率累积约束更严格,应该**以状态约束为主**
+        # GeneralDER中的x_min[t]表示Σ_{s=0}^{t} ũ(s)(包括第t个)的范围
+        # 但这里我们保持与GeneralDER一致:
+        # x_min[t] = -x_plus/a^(t+1) - x0 (至时刻t的累积,对应虚拟状态x̃(t+1))
+        # x_max[t] = x_plus/a^(t+1) - x0
+        #
+        # 关键修正: 确保约束严格来自**物理状态约束**,不混合功率累积
         
         y_lower_virt = np.zeros(T)
         y_upper_virt = np.zeros(T)
         
         for t in range(T):
-            # 基于物理状态约束的累积和
-            # x̃(t+1) 的范围决定了 Σ_{s=0}^{t} ũ(s) 的范围
-            x_tilde_t_plus_1_min = -x_plus / (a ** (t+1)) if abs(a ** (t+1)) > 1e-10 else -x_plus
-            x_tilde_t_plus_1_max = x_plus / (a ** (t+1)) if abs(a ** (t+1)) > 1e-10 else x_plus
+            # GeneralDER期望x_min[t], x_max[t]表示Σ_{s=0}^{t} ũ(s)的范围
+            # 这对应虚拟状态在时刻t+1: x̃(t+1) = x0 + Σ_{s=0}^{t} ũ(s)
+            # 由物理约束: -x_plus/a^(t+1) <= x̃(t+1) <= x_plus/a^(t+1)
+            # 所以: -x_plus/a^(t+1) - x0 <= Σ_{s=0}^{t} ũ(s) <= x_plus/a^(t+1) - x0
             
-            y_lower_state = x_tilde_t_plus_1_min - x0
-            y_upper_state = x_tilde_t_plus_1_max - x0
-            
-            # 基于功率边界的累积和(作为备选)
-            y_lower_power = np.sum(u_min_virt[:t+1])
-            y_upper_power = np.sum(u_max_virt[:t+1])
-            
-            # 优先使用状态约束(更严格且准确)
-            # 只有当状态约束范围过小(<功率累积的10%)时才回退到功率边界
-            state_range = y_upper_state - y_lower_state
-            power_range = y_upper_power - y_lower_power
-            
-            if state_range < 0.01 * abs(power_range) and power_range > 0:
-                # 状态约束过于严格,使用功率边界
-                y_lower_virt[t] = y_lower_power
-                y_upper_virt[t] = y_upper_power
-            else:
-                # 使用状态约束
-                y_lower_virt[t] = y_lower_state
-                y_upper_virt[t] = y_upper_state
+            power_denom = a ** (t+1) if abs(a ** (t+1)) > 1e-10 else 1e-10
+            y_lower_virt[t] = -x_plus / power_denom - x0
+            y_upper_virt[t] = x_plus / power_denom - x0
         
-        # 验证边界有效性
-        if not np.all(y_lower_virt <= y_upper_virt):
-            print(f"警告: TCL {i} 虚拟边界无效,使用保守边界")
-            # 回退到功率边界
-            y_lower_virt = np.cumsum(u_min_virt)
-            y_upper_virt = np.cumsum(u_max_virt)
-        
-        # 创建虚拟坐标下的TCL
+        # 【关键修正】使用正确的p/b实现,而不是GeneralDER的DP算法
+        # GeneralDER的DP算法无法正确处理指数衰减的虚拟边界
         params_virtual = DERParameters(
             u_min=u_min_virt,
             u_max=u_max_virt,
             x_min=y_lower_virt,
             x_max=y_upper_virt
         )
-        tcl_virtual = GeneralDER(params_virtual)
+        tcl_virtual = CorrectTCL_GPoly(params_virtual)  # 使用显式LP求解p/b
+        
+        # 【调试】第一个TCL时输出虚拟边界信息
+        if i == 0:
+            print(f"  [DEBUG] TCL 0: 创建 CorrectTCL_GPoly 实例")
+            print(f"  [DEBUG] TCL 0 虚拟功率边界: u_min_virt=[{u_min_virt.min():.3f}, {u_min_virt.max():.3f}], u_max_virt=[{u_max_virt.min():.3f}, {u_max_virt.max():.3f}]")
+            print(f"  [DEBUG] TCL 0 虚拟能量边界: y_lower_virt=[{y_lower_virt.min():.3f}, {y_lower_virt.max():.3f}], y_upper_virt=[{y_upper_virt.min():.3f}, {y_upper_virt.max():.3f}]")
+            print(f"  [DEBUG] TCL 0 物理参数: a={a:.4f}, delta={tcl.delta:.4f}, x_plus={x_plus:.2f}")
+        
         tcl_virtual_list.append(tcl_virtual)
     
     print(f"完成 {len(tcl_virtual_list)} 个TCL的坐标变换")
+    print(f"  [DEBUG] 所有TCL类型: {[type(tcl).__name__ for tcl in tcl_virtual_list[:3]]}...")
     
     # 4. 聚合虚拟g-polymatroid
     print("\n--- 阶段3: 聚合虚拟g-polymatroid ---")
     aggregator = Aggregator(tcl_virtual_list)
     agg_virtual = aggregator
     print("虚拟坐标聚合完成")
+    print(f"  [DEBUG] Aggregator.fleet 中设备类型: {[type(d).__name__ for d in aggregator.fleet[:3]]}...")
     
     # 5. 虚拟坐标下优化 (根据目标选择算法)
     print(f"\n--- 阶段4: 虚拟坐标优化 (目标: {objective}) ---")
     
+    # 初始化（防止未赋值）
+    u0_virtual_individual = np.zeros((N, T))
+    u0_virtual_agg = np.zeros(T)
+    
     if objective == 'cost':
         print("目标: 最小化成本")
-        u0_virtual_individual, u0_virtual_agg = _solve_cost_optimization(
+        u0_virtual_individual_cost, u0_virtual_agg_cost = _solve_cost_optimization(
             agg_virtual, prices, P0_agg, T, tcl_objs
         )
+        print("成本优化完成 (使用列生成框架)")
+        
+        # 【关键修正】将优化结果赋给主变量
+        u0_virtual_individual = u0_virtual_individual_cost
+        u0_virtual_agg = u0_virtual_agg_cost
+        
     elif objective == 'peak':
         print("目标: 最小化峰值功率")
-        u0_virtual_individual, u0_virtual_agg = _solve_peak_optimization(
+        u0_virtual_individual_peak, u0_virtual_agg_peak = _solve_peak_optimization(
             agg_virtual, P0_agg, tcl_objs, T
         )
+        print("峰值优化完成 (使用列生成框架)")
+        
+        # 【关键修正】将优化结果赋给主变量
+        u0_virtual_individual = u0_virtual_individual_peak
+        u0_virtual_agg = u0_virtual_agg_peak
     else:
         raise ValueError(f"未知的优化目标: {objective}")
     
     # 6.5 【新增】顶点分解: 将聚合信号分解为个体信号
     if objective == 'cost':
-        print("\n--- 阶段5.5: 顶点分解 (Vertex Disaggregation) ---")
-        print(f"分解为 {u0_virtual_individual.shape[0]} 个个体信号")
+        print("\n--- 阶段5.5: 虚拟信号验证 ---")
+        print(f"虚拟个体信号数: {u0_virtual_individual.shape[0]}")
         print(f"各TCL虚拟信号范围:")
         for i in range(min(3, len(u0_virtual_individual))):
             u_i = u0_virtual_individual[i]

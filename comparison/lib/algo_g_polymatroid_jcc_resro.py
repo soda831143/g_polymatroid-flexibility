@@ -33,7 +33,7 @@ from flexitroid.problems.jcc_robust_bounds import JCCRobustCalculator
 from flexitroid.utils.coordinate_transform import CoordinateTransformer
 from flexitroid.aggregations.aggregator import Aggregator
 from flexitroid.devices.general_der import GeneralDER, DERParameters
-from .peak_optimization import optimize_peak_l_infinity
+from .peak_optimization import optimize_cost_column_generation, optimize_peak_column_generation
 
 
 def solve(data: Dict, objective: str = 'cost') -> Dict[str, Any]:
@@ -183,48 +183,56 @@ def solve(data: Dict, objective: str = 'cost') -> Dict[str, Any]:
     print(f"\n步骤1.4: 虚拟坐标优化 (目标: {objective}) 得到初始解u0...")
     
     if objective == 'cost':
-        # 成本优化：在虚拟聚合空间用正确的变换目标函数系数
-        # c̃_agg[t] = c[t]·Σ_i(a_i^t/δ_i)  （关键：求和而非平均！）
+        print("使用列生成框架进行成本优化...")
+        # 成本优化：使用列生成框架处理异构变换
+        u0_physical_individual, u0_physical_agg, cost_stage1 = optimize_cost_column_generation(
+            agg_sro_virtual, prices, P0_agg, tcl_objs, T
+        )
+        
+        # 反推虚拟信号
         N = len(tcl_objs)
-        c_virtual_agg = np.zeros(T)
+        u0_virtual_individual = np.zeros((N, T))
+        for i, tcl in enumerate(tcl_objs):
+            a_i = tcl.a
+            delta_i = tcl.delta
+            for t in range(T):
+                scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
+                u0_virtual_individual[i, t] = u0_physical_individual[i, t] / scale if abs(scale) > 1e-10 else 0.0
         
-        for t in range(T):
-            scale_sum = 0
-            for i in range(N):
-                tcl = tcl_objs[i]
-                scale = (tcl.a ** t) / tcl.delta if tcl.delta > 1e-10 else 1.0
-                scale_sum += scale
-            c_virtual_agg[t] = prices[t] * scale_sum
+        u0_virtual_agg = np.sum(u0_virtual_individual, axis=0)
         
-        u0_virtual_agg = agg_sro_virtual.solve_linear_program(c_virtual_agg)
     elif objective == 'peak':
-        u0_virtual_individual, u0_virtual_agg = optimize_peak_l_infinity(
+        print("使用列生成框架进行峰值优化...")
+        # 峰值优化：使用列生成框架
+        u0_physical_individual, u0_physical_agg, peak_value = optimize_peak_column_generation(
             agg_sro_virtual, P0_agg, tcl_objs, T
         )
+        
+        # 反推虚拟信号
+        N = len(tcl_objs)
+        u0_virtual_individual = np.zeros((N, T))
+        for i, tcl in enumerate(tcl_objs):
+            a_i = tcl.a
+            delta_i = tcl.delta
+            for t in range(T):
+                scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
+                u0_virtual_individual[i, t] = u0_physical_individual[i, t] / scale if abs(scale) > 1e-10 else 0.0
+        
+        u0_virtual_agg = np.sum(u0_virtual_individual, axis=0)
+        
+        # 计算第一阶段的成本
+        P0_stage1 = u0_physical_agg + P0_agg
+        cost_stage1 = np.dot(prices, P0_stage1)
     else:
         raise ValueError(f"未知的优化目标: {objective}")
-    # 【新增】顶点分解: 将虚拟聚合信号分解为个体信号
-    print("\n步骤1.5: 顶点分解得到个体虚拟信号...")
-    u0_virtual_individual = agg_sro_virtual.disaggregate(u0_virtual_agg)
     
-    # 【关键修正】使用个体逆变换（而非平均分配）
-    u0_physical_individual = []
-    for i, (tcl, u_virt_i) in enumerate(zip(tcl_objs, u0_virtual_individual)):
-        # 使用各TCL自己的参数进行逆变换
-        a_i = tcl.a
-        delta_i = tcl.delta
-        
-        u_phys = np.zeros(T)
-        for t in range(T):
-            scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
-            u_phys[t] = u_virt_i[t] * scale
-        
-        u0_physical_individual.append(u_phys)
-    
-    u0_physical_individual = np.array(u0_physical_individual)  # (N, T)
-    u0_physical_agg = np.sum(u0_physical_individual, axis=0)
+    # 【关键】物理个体信号已由列生成函数返回
     P0_stage1 = u0_physical_agg + P0_agg
-    cost_stage1 = np.dot(prices, P0_stage1)
+    if objective == 'cost':
+        # 第一阶段的成本已计算
+        pass
+    else:
+        cost_stage1 = np.dot(prices, P0_stage1)
     
     print(f"第一阶段优化完成: 成本={cost_stage1:.2f}")
     
@@ -300,51 +308,55 @@ def solve(data: Dict, objective: str = 'cost') -> Dict[str, Any]:
     print(f"\n步骤2.4: 虚拟坐标优化 (目标: {objective}) 得到最终解...")
     
     if objective == 'cost':
-        # 成本优化：在虚拟聚合空间用正确的变换目标函数系数
-        # c̃_agg[t] = c[t]·Σ_i(a_i^t/δ_i)  （关键：求和而非平均！）
+        print("使用列生成框架进行成本优化...")
+        # 成本优化：使用列生成框架处理异构变换
+        u_final_physical_individual, u_final_physical_agg, cost_final = optimize_cost_column_generation(
+            agg_resro_virtual, prices, P0_agg, tcl_objs, T
+        )
+        
+        # 反推虚拟信号
         N = len(tcl_objs)
-        c_virtual_agg = np.zeros(T)
+        u_final_virtual_individual = np.zeros((N, T))
+        for i, tcl in enumerate(tcl_objs):
+            a_i = tcl.a
+            delta_i = tcl.delta
+            for t in range(T):
+                scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
+                u_final_virtual_individual[i, t] = u_final_physical_individual[i, t] / scale if abs(scale) > 1e-10 else 0.0
         
-        for t in range(T):
-            scale_sum = 0
-            for i in range(N):
-                tcl = tcl_objs[i]
-                scale = (tcl.a ** t) / tcl.delta if tcl.delta > 1e-10 else 1.0
-                scale_sum += scale
-            c_virtual_agg[t] = prices[t] * scale_sum
+        u_final_virtual_agg = np.sum(u_final_virtual_individual, axis=0)
         
-        u_final_virtual_agg = agg_resro_virtual.solve_linear_program(c_virtual_agg)
-        # 【新增】顶点分解: 将最终虚拟聚合信号分解为个体信号
-        print("\n步骤2.5: 顶点分解得到最终个体虚拟信号...")
-        u_final_virtual_individual = agg_resro_virtual.disaggregate(u_final_virtual_agg)
     elif objective == 'peak':
-        u_final_virtual_individual, u_final_virtual_agg = optimize_peak_l_infinity(
+        print("使用列生成框架进行峰值优化...")
+        # 峰值优化：使用列生成框架
+        u_final_physical_individual, u_final_physical_agg, peak_final = optimize_peak_column_generation(
             agg_resro_virtual, P0_agg, tcl_objs, T
         )
+        
+        # 反推虚拟信号
+        N = len(tcl_objs)
+        u_final_virtual_individual = np.zeros((N, T))
+        for i, tcl in enumerate(tcl_objs):
+            a_i = tcl.a
+            delta_i = tcl.delta
+            for t in range(T):
+                scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
+                u_final_virtual_individual[i, t] = u_final_physical_individual[i, t] / scale if abs(scale) > 1e-10 else 0.0
+        
+        u_final_virtual_agg = np.sum(u_final_virtual_individual, axis=0)
+        
+        # 计算最终成本
+        P_final = u_final_physical_agg + P0_agg
+        cost_final = np.dot(prices, P_final)
     else:
         raise ValueError(f"未知的优化目标: {objective}")
     
-    print(f"分解为 {u_final_virtual_individual.shape[0]} 个最终个体虚拟信号")
-    
-    # 【关键修正】使用个体逆变换
-    u_final_physical_individual = []
-    for i, (tcl, u_virt_i) in enumerate(zip(tcl_objs, u_final_virtual_individual)):
-        a_i = tcl.a
-        delta_i = tcl.delta
-        
-        u_phys = np.zeros(T)
-        for t in range(T):
-            scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
-            u_phys[t] = u_virt_i[t] * scale
-        
-        u_final_physical_individual.append(u_phys)
-    
-    u_final_physical_individual = np.array(u_final_physical_individual)
-    u_final_physical_agg = np.sum(u_final_physical_individual, axis=0)
-    
+    # 【关键】物理个体信号已由列生成函数返回
     P_final = u_final_physical_agg + P0_agg
-    cost_final = np.dot(prices, P_final)
-    peak_final = np.max(P_final)
+    if objective == 'cost':
+        peak_final = np.max(P_final)
+    else:
+        cost_final = np.dot(prices, P_final)
     
     computation_time = time.time() - t0
     

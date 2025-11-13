@@ -61,6 +61,13 @@ def algo(data):
     
     pre_algo_time = time.time() - start_time
     
+    # 【诊断输出】打印第一个TCL的边界值，用于与G-Poly算法对比
+    print(f"\n[Exact] TCL 0 物理边界:")
+    print(f"  x_min_phys={x_min_phys_all[0]:.4f}, x_max_phys={x_max_phys_all[0]:.4f}")
+    print(f"  a={a_all[0]:.4f}, delta={delta_all[0]:.4f}")
+    print(f"  u_min_phys范围=[{u_min_all[:, 0].min():.4f}, {u_min_all[:, 0].max():.4f}]")
+    print(f"  u_max_phys范围=[{u_max_all[:, 0].min():.4f}, {u_max_all[:, 0].max():.4f}]")
+    
     # 3. 求解优化问题
     results = {'status': 'error: optimization failed'}
 
@@ -79,13 +86,18 @@ def algo(data):
 
                 for i in range(num_households):
                     model.addConstr(x[i, 0] == x0_all[i])
+                    
+                    # 【关键修正】: 状态约束在 t=0 时刻也必须满足
+                    model.addConstr(x[i, 0] >= x_min_phys_all[i])
+                    model.addConstr(x[i, 0] <= x_max_phys_all[i])
+                    
                     # 循环 periods 次, 从 t=0 到 T-1
                     for t in range(periods):
                         # 【核心修正】: x_{t+1} = a*x_t + delta*u_t
                         # Gurobi变量索引从0开始, x[i, t+1]对应x_i(t+1), x[i,t]对应x_i(t), u[t,i]对应u_i(t)
                         model.addConstr(x[i, t + 1] == a_all[i] * x[i, t] + delta_all[i] * u[t, i])
                         
-                        # 状态约束施加在 t+1 时刻的状态上
+                        # 状态约束施加在 t+1 时刻的状态上 (对所有未来时刻)
                         model.addConstr(x[i, t + 1] >= x_min_phys_all[i])
                         model.addConstr(x[i, t + 1] <= x_max_phys_all[i])
                 
@@ -120,6 +132,11 @@ def algo(data):
 
                 for i in range(num_households):
                     model.addConstr(x[i, 0] == x0_all[i])
+                    
+                    # 【关键修正】: 状态约束在 t=0 时刻也必须满足
+                    model.addConstr(x[i, 0] >= x_min_phys_all[i])
+                    model.addConstr(x[i, 0] <= x_max_phys_all[i])
+                    
                     for t in range(periods):
                         model.addConstr(x[i, t + 1] == a_all[i] * x[i, t] + delta_all[i] * u[t, i])
                         model.addConstr(x[i, t + 1] >= x_min_phys_all[i])
