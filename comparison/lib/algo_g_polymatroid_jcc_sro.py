@@ -17,9 +17,10 @@ from flexitroid.utils.coordinate_transform import CoordinateTransformer
 from flexitroid.problems.jcc_robust_bounds import JCCRobustCalculator
 from flexitroid.devices.tcl import TCL
 from flexitroid.devices.general_der import GeneralDER, DERParameters
+from .peak_optimization import optimize_peak_l_infinity
 
 
-def solve(data: dict, tcl_objs: List = None) -> dict:
+def solve(data: dict, tcl_objs: List = None, objective='cost') -> dict:
     """
     JCC-SRO算法主函数
     
@@ -28,7 +29,7 @@ def solve(data: dict, tcl_objs: List = None) -> dict:
     2. 计算SRO鲁棒边界(每个TCL基于椭球集)
     3. 物理坐标变换到虚拟坐标(有损→无损)
     4. 聚合所有TCL的虚拟g-polymatroid
-    5. 在虚拟坐标下优化
+    5. 在虚拟坐标下优化 (成本或峰值)
     6. 逆变换回物理坐标
     
     Args:
@@ -45,6 +46,7 @@ def solve(data: dict, tcl_objs: List = None) -> dict:
                 'delta': 统计置信度
               }
         tcl_objs: TCL对象列表(可选)
+        objective: 优化目标 ('cost' 或 'peak')
     
     Returns:
         结果字典 {
@@ -52,6 +54,7 @@ def solve(data: dict, tcl_objs: List = None) -> dict:
             'total_cost': 总成本,
             'peak_power': 峰值功率,
             'computation_time': 计算时间,
+            'objective': 优化目标,
             'sro_bounds': SRO鲁棒边界,
             'U_initial': 椭球不确定性集参数
         }
@@ -179,49 +182,87 @@ def solve(data: dict, tcl_objs: List = None) -> dict:
     agg_virtual = aggregator  # aggregator就是聚合后的对象
     print("虚拟坐标聚合完成")
     
-    # 6. 虚拟坐标下优化
-    print("\n--- 阶段5: 虚拟坐标优化 ---")
-    # 虚拟坐标下的成本向量(价格不变)
-    c_virtual = prices
-    u0_virtual_agg = agg_virtual.solve_linear_program(c_virtual)
-    print(f"虚拟坐标最优解范围: [{u0_virtual_agg.min():.3f}, {u0_virtual_agg.max():.3f}]")
+    # 6. 虚拟坐标下优化 (根据目标选择算法)
+    print(f"\n--- 阶段5: 虚拟坐标优化 (目标: {objective}) ---")
     
-    # 7. 逆变换到物理坐标
-    print("\n--- 阶段6: 逆变换到物理坐标 ---")
-    # 平均分配聚合解到各个TCL
-    u0_virtual_individual = np.array([u0_virtual_agg / N for _ in range(N)])
-    
-    # 逆变换: u(k) = (a^k / δ) * ũ(k)
-    u0_physical_individual = []
-    for i, tcl_robust in enumerate(tcl_robust_list):
-        a = tcl_robust.a
-        delta = tcl_robust.delta
-        u_phys = np.zeros(T)
+    if objective == 'cost':
+        # 成本优化：在虚拟聚合空间用正确的变换目标函数系数
+        # c̃_agg[t] = c[t]·Σ_i(a_i^t/δ_i)  （关键：求和而非平均！）
+        N = len(tcl_objs)
+        c_virtual_agg = np.zeros(T)
+        
         for t in range(T):
-            scale = (a ** t) / delta if delta > 1e-10 else 1.0
-            u_phys[t] = u0_virtual_individual[i][t] * scale
-        u0_physical_individual.append(u_phys)
+            scale_sum = 0
+            for i in range(N):
+                tcl = tcl_objs[i]
+                scale = (tcl.a ** t) / tcl.delta if tcl.delta > 1e-10 else 1.0
+                scale_sum += scale
+            c_virtual_agg[t] = prices[t] * scale_sum
+        
+        u0_virtual_agg = agg_virtual.solve_linear_program(c_virtual_agg)
+        # 顶点分解
+        u0_virtual_individual = aggregator.disaggregate(u0_virtual_agg)
+    
+    elif objective == 'peak':
+        # 峰值优化: 使用L-infinity求解
+        u0_virtual_individual, u0_virtual_agg = optimize_peak_l_infinity(
+            agg_virtual, P0_agg, tcl_objs, T
+        )
+    else:
+        raise ValueError(f"未知的优化目标: {objective}")
+    
+    # 7. 【新增】顶点分解: 将聚合信号分解为个体信号 (成本优化已做,峰值优化内部处理)
+    if objective == 'cost':
+        print("\n--- 阶段6: 顶点分解 (Vertex Disaggregation) ---")
+        print(f"分解为 {u0_virtual_individual.shape[0]} 个个体信号")
+        print(f"各TCL虚拟信号范围:")
+        for i in range(min(3, len(u0_virtual_individual))):
+            u_i = u0_virtual_individual[i]
+            print(f"  TCL {i}: [{u_i.min():.3f}, {u_i.max():.3f}]")
+        if len(u0_virtual_individual) > 3:
+            print(f"  ... (共{len(u0_virtual_individual)}个)")
+    
+    # 8. 逆变换到物理坐标 (对每个TCL单独进行)
+    print("\n--- 阶段7: 逆变换到物理坐标 (Individual) ---")
+    
+    u0_physical_individual = []
+    for i, (tcl, u_virt_i) in enumerate(zip(tcl_objs, u0_virtual_individual)):
+        # 使用各TCL自己的参数进行逆变换
+        a_i = tcl.a
+        delta_i = tcl.delta
+        
+        u_phys_i = np.zeros(T)
+        for t in range(T):
+            scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
+            u_phys_i[t] = u_virt_i[t] * scale
+        
+        u0_physical_individual.append(u_phys_i)
     
     u0_physical_individual = np.array(u0_physical_individual)
+    print(f"逆变换完成: {u0_physical_individual.shape}")
     
-    # 聚合物理解
+    # 聚合物理信号
     u0_physical_agg = np.sum(u0_physical_individual, axis=0)
     
     # 调试: 检查形状
     print(f"\n[调试] u0_physical_agg 形状: {u0_physical_agg.shape}")
+    print(f"[调试] u0_physical_agg 范围: [{u0_physical_agg.min():.3f}, {u0_physical_agg.max():.3f}]")
     print(f"[调试] P0_agg 形状: {P0_agg.shape}")
     print(f"[调试] P0_agg 范围: [{P0_agg.min():.3f}, {P0_agg.max():.3f}]")
     
     # 转换为实际功率
     P_total = u0_physical_agg + P0_agg
     
-    # 8. 计算指标
+    print(f"[调试] P_total 形状: {P_total.shape}")
+    print(f"[调试] P_total 范围: [{P_total.min():.3f}, {P_total.max():.3f}]")
+    
+    # 9. 计算指标
     total_cost = np.dot(prices, P_total)
     peak_power = np.max(P_total)
     computation_time = time.time() - start_time
     
     print("\n" + "="*80)
-    print("JCC-SRO算法完成")
+    print(f"JCC-SRO算法完成 (目标: {objective})")
     print(f"总成本: {total_cost:.2f}")
     print(f"峰值功率: {peak_power:.2f}")
     print(f"计算时间: {computation_time:.3f}s")
@@ -229,10 +270,12 @@ def solve(data: dict, tcl_objs: List = None) -> dict:
     
     return {
         'aggregate_flexibility': P_total,
+        'individual_flexibility': u0_physical_individual,
         'total_cost': total_cost,
         'peak_power': peak_power,
         'computation_time': computation_time,
+        'objective': objective,
         'sro_bounds': b_robust_sro,
         'U_initial': U_initial,
-        'algorithm': 'JCC-SRO'
+        'algorithm': f'JCC-SRO-{objective.upper()}'
     }

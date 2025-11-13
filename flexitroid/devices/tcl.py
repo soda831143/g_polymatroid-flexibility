@@ -64,38 +64,29 @@ class TCL(Flexitroid):
             P0_unconstrained = (np.asarray(theta_a_forecast) - self.theta_r) / self.b_coef
             P0_forecast = np.maximum(0.0, P0_unconstrained)
 
-            y_lower = y_upper = None
-            try:
-                if use_provable_inner:
-                    y_lower, y_upper = solve_provably_inner_approximation(
-                        tcl_params={**self.tcl_params, "theta_a_forecast": theta_a_forecast}
-                    )
-                else:
-                    y_lower, y_upper = solve_deterministic_maximal_inner_approximation(
-                        tcl_params={**self.tcl_params, "theta_a_forecast": theta_a_forecast}
-                    )
-            except Exception:
-                y_lower = y_upper = None
-
             u_min_det = -P0_forecast
             u_max_det = self.P_m - P0_forecast
 
-            if y_lower is None or y_upper is None:
-                y_lower = np.cumsum(u_min_det)[:T]
-                y_upper = np.cumsum(u_max_det)[:T]
+            # 计算g-polymatroid的累积能量边界
+            # 注意: 这里的边界是累积和 sum_{s=0}^{t} u(s) 的范围,不是物理状态x(t)
+            # g-polymatroid的p()和b()函数会自动考虑物理状态约束的影响
+            y_lower_cumsum = np.cumsum(u_min_det)[:T]
+            y_upper_cumsum = np.cumsum(u_max_det)[:T]
 
-            # 确保是一维数组且长度为 T
-            y_lower = np.asarray(y_lower).reshape(-1)[:T]
-            y_upper = np.asarray(y_upper).reshape(-1)[:T]
-
-            params_g_poly = DERParameters(u_min=u_min_det, u_max=u_max_det, x_min=y_lower, x_max=y_upper)
+            # 使用累积和边界构建g-polymatroid
+            params_g_poly = DERParameters(u_min=u_min_det, u_max=u_max_det, x_min=y_lower_cumsum, x_max=y_upper_cumsum)
             self._internal_g_poly = GeneralDER(params_g_poly)
             
             # 构建物理约束矩阵 (H-representation: A*[u; x] <= b)
             # 约束形式:
             # 1. u_min <= u <= u_max  (功率约束,每个时刻)
-            # 2. x_min <= x <= x_max  (状态约束,每个时刻)
+            # 2. x_min_phys <= x <= x_max_phys  (物理状态约束,每个时刻)
             # 其中 x(k) = a*x(k-1) + delta*u(k)
+            
+            # 计算物理状态边界(用于JCC鲁棒优化)
+            x_plus = (self.C_th * self.delta_val) / self.eta if self.eta > 0 else 100.0
+            x_min_phys = -x_plus
+            x_max_phys = x_plus
             
             # 注意: 温度预测误差仅影响 u 的边界,不影响 x 的边界
             # P0(θ_a + ξ) = (θ_a + ξ - θ_r)/b
@@ -123,16 +114,16 @@ class TCL(Flexitroid):
                 b_nom[row_idx] = -u_min_det[t]  # RHS = P0_forecast
                 row_idx += 1
             
-            # x的上界约束: x_t <= x_max_t
+            # x的上界约束: x_t <= x_max_phys (使用物理边界)
             for t in range(T):
                 A[row_idx, T + t] = 1.0
-                b_nom[row_idx] = y_upper[t]
+                b_nom[row_idx] = x_max_phys  # 物理上界(常数)
                 row_idx += 1
             
-            # x的下界约束: x_t >= x_min_t → -x_t <= -x_min_t
+            # x的下界约束: x_t >= x_min_phys → -x_t <= -x_min_phys (使用物理边界)
             for t in range(T):
                 A[row_idx, T + t] = -1.0
-                b_nom[row_idx] = -y_lower[t]
+                b_nom[row_idx] = -x_min_phys  # 物理下界(常数)
                 row_idx += 1
             
             self.A_phys = A
@@ -195,6 +186,10 @@ class TCL(Flexitroid):
         将 x(k) = sum_{j=0}^{k-1} a^{k-1-j}·delta·u(j) + a^k·x0
         代入 x 的约束,得到关于 u 的约束。
         
+        【关键修正】: 使用物理状态边界,而不是g-polymatroid的操作边界。
+        物理边界基于TCL的热容量和温度范围,比操作边界更严格,
+        能够防止优化器选择u=-P0的平凡解。
+        
         Returns:
             tuple: (A_u, b_u) 其中 A_u @ u <= b_u
         """
@@ -206,16 +201,26 @@ class TCL(Flexitroid):
         delta = self.tcl_params['delta']
         x0 = self.tcl_params['x0']
         
+        # 使用物理状态边界 (与Exact算法一致)
+        x_plus = (self.tcl_params['C_th'] * self.tcl_params['delta_val']) / self.tcl_params['eta'] if self.tcl_params['eta'] > 0 else 100.0
+        x_min_phys = -x_plus
+        x_max_phys = x_plus
+        
+        # 【关键修正】: 使用物理边界代替g-polymatroid的y_lower/y_upper
+        # 物理边界对所有时刻是常数,更严格
+        y_lower_phys = np.full(T, x_min_phys)
+        y_upper_phys = np.full(T, x_max_phys)
+        
         # A_phys 结构: [u约束(2T行); x约束(2T行)], 变量顺序 [u_0...u_{T-1}, x_0...x_{T-1}]
         # 我们需要提取:
         # 1. 直接的 u 约束 (前2T行)
-        # 2. x 约束转换为 u 约束 (后2T行)
+        # 2. x 约束转换为 u 约束 (后2T行,但使用物理边界)
         
         # 直接u约束: A_u @ u <= b_u (前2T行,仅涉及前T列)
         A_u_direct = self.A_phys[:2*T, :T]  # shape (2T, T)
         b_u_direct = self.b_phys_nom[:2*T]
         
-        # x约束转换: x_上界和x_下界约束
+        # x约束转换: 使用物理边界而不是名义边界
         # x(k) = a·x(k-1) + delta·u(k), x(0) = x0
         # 递推展开: x(k) = a^k·x0 + sum_{j=0}^{k} a^{k-j}·delta·u(j)
         # 构建转换矩阵 M: x = M @ u + x0_offset
@@ -227,17 +232,19 @@ class TCL(Flexitroid):
             for j in range(k + 1):  # 包括当前时刻 j=k
                 M[k, j] = (a ** (k - j)) * delta
         
-        # x约束: A_x @ x <= b_x
-        # 代入 x = M @ u + offset: A_x @ (M @ u + offset) <= b_x
-        # 即: (A_x @ M) @ u <= b_x - A_x @ offset
-        A_x = self.A_phys[2*T:, T:]  # shape (2T, T), x相关列
-        b_x = self.b_phys_nom[2*T:]
+        # 构建物理状态约束: x_min_phys <= x(k) <= x_max_phys
+        # 转换为: x_min_phys <= M @ u + offset <= x_max_phys
+        # 即: M @ u <= x_max_phys - offset  (上界)
+        #    -M @ u <= -x_min_phys + offset (下界)
         
-        A_u_from_x = A_x @ M  # shape (2T, T)
-        b_u_from_x = b_x - A_x @ x0_offset
+        A_x_upper = M  # shape (T, T)
+        b_x_upper = y_upper_phys - x0_offset
+        
+        A_x_lower = -M  # shape (T, T)
+        b_x_lower = -y_lower_phys + x0_offset
         
         # 合并所有u约束
-        A_u_combined = np.vstack([A_u_direct, A_u_from_x])  # shape (4T, T)
-        b_u_combined = np.concatenate([b_u_direct, b_u_from_x])
+        A_u_combined = np.vstack([A_u_direct, A_x_upper, A_x_lower])  # shape (4T, T)
+        b_u_combined = np.concatenate([b_u_direct, b_x_upper, b_x_lower])
         
         return A_u_combined, b_u_combined

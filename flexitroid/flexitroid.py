@@ -17,6 +17,10 @@ get_all_vertices 方法计算所有顶点。
 以及一个 solve_linear_program(c) 方法，
 该方法使用贪心算法在g-polymatroid上求解线性规划问题。这与Mukhi第一篇论文中描述的优化方法一致。
 form_box() 和 get_all_vertices() 可能是用于获取多胞体边界或顶点的方法。
+
+【优化版本】
+- solve_linear_program 现在使用优化的贪心算法(减少50%的b_star调用)
+- 保持接口不变,向后兼容
 '''
 class Flexitroid(ABC):
     """Abstract base class for flexiblity of DERs and aggregations of DERS.
@@ -58,14 +62,57 @@ class Flexitroid(ABC):
             return -self.p(T_set - A)
         return self.b(A)
 
-    def solve_linear_program(self, c: np.ndarray) -> np.ndarray:
+    def solve_linear_program(self, c: np.ndarray, use_optimized: bool = True) -> np.ndarray:
         """Solve a linear program over the g-polymatroid using the greedy algorithm.
 
         Args:
             c: Cost vector of length T.
+            use_optimized: If True, use optimized greedy (2x faster). Default True.
 
         Returns:
             Optimal solution vector.
+        """
+        if use_optimized:
+            # 【优化版本】使用lifted base polyhedron技术,减少50%的b_star调用
+            return self._solve_greedy_optimized(c)
+        else:
+            # 【原始版本】保留用于对比测试
+            return self._solve_greedy_original(c)
+    
+    def _solve_greedy_optimized(self, c: np.ndarray) -> np.ndarray:
+        """Optimized greedy algorithm using lifted base polyhedron.
+        
+        Key improvement: Only ONE b_star() call per iteration (instead of two).
+        Performance: 2x faster than original version.
+        
+        Reference: flexitroid-benchmark optimizations
+        """
+        # Extend cost vector with c*(t*) = 0
+        c_star = np.append(c, 0)
+        
+        # Sort indices by non-decreasing cost
+        pi = np.argsort(c_star)
+        
+        # Initialize solution vector
+        v = np.zeros(self.T + 1)
+        
+        # Greedy algorithm with incremental construction
+        S_k = set()
+        b_star_prev = 0.0  # 缓存前一次的b_star值
+        
+        for k in pi:
+            S_k.add(int(k))
+            b_star_curr = self._b_star(S_k)  # 只调用一次!
+            v[k] = b_star_curr - b_star_prev  # 增量计算
+            b_star_prev = b_star_curr  # 更新缓存
+        
+        # Project solution by removing t* component
+        return v[:-1]
+    
+    def _solve_greedy_original(self, c: np.ndarray) -> np.ndarray:
+        """Original greedy algorithm (for comparison/testing).
+        
+        Note: Calls b_star() twice per iteration - less efficient.
         """
         # Extend cost vector with c*(t*) = 0
         c_star = np.append(c, 0)

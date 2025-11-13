@@ -9,7 +9,9 @@ __init__ 方法接收一个设备列表 fleet 进行聚合。
 """
 
 from typing import List, Set, TypeVar, Generic
+import numpy as np
 from flexitroid.flexitroid import Flexitroid
+from flexitroid.problems.signal_tracker import SignalTracker
 
 D = TypeVar("D", bound=Flexitroid)
 # 定义一个类型变量 D。
@@ -98,3 +100,60 @@ class Aggregator(Flexitroid, Generic[D]):
         # 遍历 self.fleet 中的每个设备 device。
         # 对每个设备调用其自身的 .p(A) 方法。
         # sum() 函数将所有这些单独的 p(A) 值加起来，得到聚合的 p(A) 值。
+    
+    def disaggregate(self, signal: np.ndarray) -> np.ndarray:
+        """
+        将聚合信号分解为个体信号（顶点分解）
+        
+        使用Dantzig-Wolfe分解方法：
+        1. 使用SignalTracker找到signal的凸组合表示: signal = Σλ_j·v_j
+        2. 对每个设备i，计算: u_i = Σλ_j·v_ij，其中v_ij = device_i.greedy(c_j)
+        3. 保证: Σu_i = signal 且每个u_i在各自的可行域内
+        
+        应用场景:
+        - 支持异构TCL（不同的a_i, δ_i参数）
+        - JCC-SRO/Re-SRO算法的逆变换前需要分解
+        
+        Args:
+            signal: 聚合信号 (T,) numpy数组
+        
+        Returns:
+            disaggregation: (N, T) 个体信号矩阵，其中N为设备数量
+        """
+        print(f"\n  [Disaggregation] 开始分解聚合信号...")
+        
+        # 1. 使用SignalTracker找到凸组合表示
+        tracker = SignalTracker(self, signal, max_iters=1000)
+        tracker.solve()
+        
+        # 2. 获取顶点和权重
+        vertices, weights = tracker.get_vertices_and_weights()
+        pi = tracker.PI[tracker.lmda > 1e-10]  # 对应的梯度向量
+        
+        print(f"  [Disaggregation] 找到 {len(weights)} 个有效顶点")
+        print(f"  [Disaggregation] 凸组合误差: {np.linalg.norm(vertices.T @ weights - signal):.2e}")
+        
+        # 3. 为每个设备分配信号
+        disaggregation = []
+        for i, device in enumerate(self.fleet):
+            u_i = np.zeros(self.T)
+            
+            # 使用相同的λ和c为每个设备构造信号
+            for lmda, c in zip(weights, pi):
+                # 在设备的可行域上求解线性规划
+                vertex_i = device.solve_linear_program(c)
+                u_i += lmda * vertex_i
+            
+            disaggregation.append(u_i)
+        
+        disaggregation = np.array(disaggregation)
+        
+        # 验证分解正确性
+        u_sum = np.sum(disaggregation, axis=0)
+        error = np.linalg.norm(u_sum - signal)
+        print(f"  [Disaggregation] 重构误差: {error:.2e}")
+        
+        if error > 1e-3:
+            print(f"  警告: 分解误差较大 ({error:.2e}), 可能需要更多迭代")
+        
+        return disaggregation

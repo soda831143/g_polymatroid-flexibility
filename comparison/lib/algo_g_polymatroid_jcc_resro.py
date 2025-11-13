@@ -33,9 +33,10 @@ from flexitroid.problems.jcc_robust_bounds import JCCRobustCalculator
 from flexitroid.utils.coordinate_transform import CoordinateTransformer
 from flexitroid.aggregations.aggregator import Aggregator
 from flexitroid.devices.general_der import GeneralDER, DERParameters
+from .peak_optimization import optimize_peak_l_infinity
 
 
-def solve(data: Dict) -> Dict[str, Any]:
+def solve(data: Dict, objective: str = 'cost') -> Dict[str, Any]:
     """
     JCC-Re-SRO算法主函数 (两阶段优化)
     
@@ -59,6 +60,9 @@ def solve(data: Dict) -> Dict[str, Any]:
                 'D_calib': SRO校准集温度误差数据 (n2, T) [数据D的25%]
                 'D_resro_calib': Re-SRO独立校准集温度误差数据 (n3, T) [数据D的50%,独立于SRO]
                 'epsilon': JCC违反概率上限
+                'delta': 置信度
+              }
+        objective: 优化目标 ('cost' 或 'peak')
                 'delta': 统计置信度
               }
             - 'prices': 电价 (T,)
@@ -176,22 +180,48 @@ def solve(data: Dict) -> Dict[str, Any]:
     agg_sro_virtual = Aggregator(tcl_virtual_sro_list)
     
     # 1.4 第一次优化得到u0
-    print("\n步骤1.4: 虚拟坐标优化得到初始解u0...")
-    u0_virtual_agg = agg_sro_virtual.solve_linear_program(prices)
+    print(f"\n步骤1.4: 虚拟坐标优化 (目标: {objective}) 得到初始解u0...")
     
-    # 分解并逆变换
-    u0_virtual_individual = np.array([u0_virtual_agg / N for _ in range(N)])
+    if objective == 'cost':
+        # 成本优化：在虚拟聚合空间用正确的变换目标函数系数
+        # c̃_agg[t] = c[t]·Σ_i(a_i^t/δ_i)  （关键：求和而非平均！）
+        N = len(tcl_objs)
+        c_virtual_agg = np.zeros(T)
+        
+        for t in range(T):
+            scale_sum = 0
+            for i in range(N):
+                tcl = tcl_objs[i]
+                scale = (tcl.a ** t) / tcl.delta if tcl.delta > 1e-10 else 1.0
+                scale_sum += scale
+            c_virtual_agg[t] = prices[t] * scale_sum
+        
+        u0_virtual_agg = agg_sro_virtual.solve_linear_program(c_virtual_agg)
+    elif objective == 'peak':
+        u0_virtual_individual, u0_virtual_agg = optimize_peak_l_infinity(
+            agg_sro_virtual, P0_agg, tcl_objs, T
+        )
+    else:
+        raise ValueError(f"未知的优化目标: {objective}")
+    # 【新增】顶点分解: 将虚拟聚合信号分解为个体信号
+    print("\n步骤1.5: 顶点分解得到个体虚拟信号...")
+    u0_virtual_individual = agg_sro_virtual.disaggregate(u0_virtual_agg)
+    
+    # 【关键修正】使用个体逆变换（而非平均分配）
     u0_physical_individual = []
-    for i, tcl in enumerate(tcl_objs):
-        a = tcl.a
-        delta = tcl.delta
+    for i, (tcl, u_virt_i) in enumerate(zip(tcl_objs, u0_virtual_individual)):
+        # 使用各TCL自己的参数进行逆变换
+        a_i = tcl.a
+        delta_i = tcl.delta
+        
         u_phys = np.zeros(T)
         for t in range(T):
-            scale = (a ** t) / delta if delta > 1e-10 else 1.0
-            u_phys[t] = u0_virtual_individual[i][t] * scale
+            scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
+            u_phys[t] = u_virt_i[t] * scale
+        
         u0_physical_individual.append(u_phys)
-    u0_physical_individual = np.array(u0_physical_individual)  # (N, T)
     
+    u0_physical_individual = np.array(u0_physical_individual)  # (N, T)
     u0_physical_agg = np.sum(u0_physical_individual, axis=0)
     P0_stage1 = u0_physical_agg + P0_agg
     cost_stage1 = np.dot(prices, P0_stage1)
@@ -267,23 +297,51 @@ def solve(data: Dict) -> Dict[str, Any]:
     agg_resro_virtual = Aggregator(tcl_virtual_resro_list)
     
     # 2.4 第二次优化得到最终解
-    print("\n步骤2.4: 虚拟坐标优化得到最终解...")
-    u_final_virtual_agg = agg_resro_virtual.solve_linear_program(prices)
+    print(f"\n步骤2.4: 虚拟坐标优化 (目标: {objective}) 得到最终解...")
     
-    # 分解并逆变换
-    u_final_virtual_individual = np.array([u_final_virtual_agg / N for _ in range(N)])
+    if objective == 'cost':
+        # 成本优化：在虚拟聚合空间用正确的变换目标函数系数
+        # c̃_agg[t] = c[t]·Σ_i(a_i^t/δ_i)  （关键：求和而非平均！）
+        N = len(tcl_objs)
+        c_virtual_agg = np.zeros(T)
+        
+        for t in range(T):
+            scale_sum = 0
+            for i in range(N):
+                tcl = tcl_objs[i]
+                scale = (tcl.a ** t) / tcl.delta if tcl.delta > 1e-10 else 1.0
+                scale_sum += scale
+            c_virtual_agg[t] = prices[t] * scale_sum
+        
+        u_final_virtual_agg = agg_resro_virtual.solve_linear_program(c_virtual_agg)
+        # 【新增】顶点分解: 将最终虚拟聚合信号分解为个体信号
+        print("\n步骤2.5: 顶点分解得到最终个体虚拟信号...")
+        u_final_virtual_individual = agg_resro_virtual.disaggregate(u_final_virtual_agg)
+    elif objective == 'peak':
+        u_final_virtual_individual, u_final_virtual_agg = optimize_peak_l_infinity(
+            agg_resro_virtual, P0_agg, tcl_objs, T
+        )
+    else:
+        raise ValueError(f"未知的优化目标: {objective}")
+    
+    print(f"分解为 {u_final_virtual_individual.shape[0]} 个最终个体虚拟信号")
+    
+    # 【关键修正】使用个体逆变换
     u_final_physical_individual = []
-    for i, tcl in enumerate(tcl_objs):
-        a = tcl.a
-        delta = tcl.delta
+    for i, (tcl, u_virt_i) in enumerate(zip(tcl_objs, u_final_virtual_individual)):
+        a_i = tcl.a
+        delta_i = tcl.delta
+        
         u_phys = np.zeros(T)
         for t in range(T):
-            scale = (a ** t) / delta if delta > 1e-10 else 1.0
-            u_phys[t] = u_final_virtual_individual[i][t] * scale
+            scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
+            u_phys[t] = u_virt_i[t] * scale
+        
         u_final_physical_individual.append(u_phys)
-    u_final_physical_individual = np.array(u_final_physical_individual)
     
+    u_final_physical_individual = np.array(u_final_physical_individual)
     u_final_physical_agg = np.sum(u_final_physical_individual, axis=0)
+    
     P_final = u_final_physical_agg + P0_agg
     cost_final = np.dot(prices, P_final)
     peak_final = np.max(P_final)
@@ -291,7 +349,7 @@ def solve(data: Dict) -> Dict[str, Any]:
     computation_time = time.time() - t0
     
     print("\n" + "="*80)
-    print("JCC-Re-SRO两阶段算法完成")
+    print(f"JCC-Re-SRO两阶段算法完成 (目标: {objective})")
     print(f"第一阶段(SRO)成本: {cost_stage1:.2f}")
     print(f"第二阶段(Re-SRO)成本: {cost_final:.2f}")
     print(f"成本改善: {cost_stage1 - cost_final:.2f} ({(cost_stage1-cost_final)/cost_stage1*100:.2f}%)")
@@ -301,15 +359,16 @@ def solve(data: Dict) -> Dict[str, Any]:
     
     return {
         'aggregate_flexibility': P_final,
+        'individual_flexibility': u_final_physical_individual,
         'total_cost': cost_final,
         'peak_power': peak_final,
         'computation_time': computation_time,
+        'objective': objective,
         'sro_cost': cost_stage1,
         'resro_cost': cost_final,
         'cost_improvement': cost_stage1 - cost_final,
         'U_initial': U_initial,
-        'U_final': U_final,
-        'algorithm': 'JCC-Re-SRO'
+        'algorithm': f'JCC-Re-SRO-{objective.upper()}'
     }
 
 
