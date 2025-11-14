@@ -279,13 +279,16 @@ def run_algorithm(algo_name, algo_module, data, objective=None):
             cost = result.get('total_cost', np.nan)
             peak = result.get('peak_power', np.nan)
             comp_time = result.get('computation_time', total_time)
+            constraints_ok = result.get('constraints_satisfied', True)
             
-            print(f"    完成: cost={cost:.3f}, peak={peak:.3f} (t={comp_time:.3f}s)")
+            status_str = "✓" if constraints_ok else "✗ 不可行"
+            print(f"    完成: cost={cost:.3f}, peak={peak:.3f} (t={comp_time:.3f}s) {status_str}")
             return {
                 'cost_value': cost, 'peak_value': peak,
                 'cost_time': comp_time, 'peak_time': comp_time,
                 'total_time': comp_time,
-                'algorithm': algo_name, 'objective': objective, 'result': result
+                'algorithm': algo_name, 'objective': objective, 'result': result,
+                'constraints_satisfied': constraints_ok
             }
         else:
             # 传统算法使用algo()接口（同时返回成本和峰值）
@@ -306,7 +309,14 @@ def run_algorithm(algo_name, algo_module, data, objective=None):
         print(f"    错误: {e}")
         import traceback
         traceback.print_exc()
-        return {'cost_value': np.nan, 'peak_value': np.nan, 'status': f'error: {e}', 'total_time': 0.0}
+        return {
+            'cost_value': np.nan, 
+            'peak_value': np.nan, 
+            'cost_time': 0.0,
+            'peak_time': 0.0,
+            'total_time': 0.0,
+            'status': f'error: {e}'
+        }
     
 # --- UPR计算和结果保存 ---
 def calculate_and_save_upr(df, algorithms, output_dir):
@@ -505,7 +515,13 @@ def run_advanced_comparison(num_samples, num_households, periods, num_days, num_
                 sample_results[f"{name}_peak_value"] = result_peak['peak_value']
                 sample_results[f"{name}_peak_time"] = result_peak['peak_time']
                 sample_results[f"{name}_total_time"] = result_cost['total_time'] + result_peak['total_time']
-                sample_results[f"{name}_status"] = 'success'
+                
+                # 记录约束满足情况
+                cost_constraints = result_cost.get('constraints_satisfied', True)
+                peak_constraints = result_peak.get('constraints_satisfied', True)
+                sample_results[f"{name}_cost_constraints_ok"] = cost_constraints
+                sample_results[f"{name}_peak_constraints_ok"] = peak_constraints
+                sample_results[f"{name}_status"] = 'success' if (cost_constraints and peak_constraints) else 'infeasible'
                 
             else:
                 # 传统算法：一次运行同时得到成本和峰值
@@ -527,7 +543,16 @@ def run_advanced_comparison(num_samples, num_households, periods, num_days, num_
             avg_cost = df[f'{name}_cost_value'].mean()
             avg_peak = df[f'{name}_peak_value'].mean()
             avg_time = df[f'{name}_total_time'].mean()
-            print(f"  {name:<25} Cost={avg_cost:<10.2f} Peak={avg_peak:<10.2f} Time={avg_time:<8.3f}s")
+            
+            # 检查约束满足情况
+            constraint_info = ""
+            if f'{name}_cost_constraints_ok' in df.columns:
+                cost_ok = df[f'{name}_cost_constraints_ok'].all()
+                peak_ok = df[f'{name}_peak_constraints_ok'].all()
+                if not cost_ok or not peak_ok:
+                    constraint_info = " [约束违反!]"
+            
+            print(f"  {name:<25} Cost={avg_cost:<10.2f} Peak={avg_peak:<10.2f} Time={avg_time:<8.3f}s{constraint_info}")
     
     calculate_and_save_upr(df, list(ALGORITHMS.keys()), "comparison_results")
 

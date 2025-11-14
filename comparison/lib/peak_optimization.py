@@ -94,13 +94,12 @@ def optimize_cost_column_generation(aggregator_virtual, prices, P0_physical, tcl
     vertices_individual = []  # 存储个体顶点分解 v_ij (关键!)
     vertices_physical = []  # 存储对应的物理聚合信号 Σ_i γ_i · v_ij
     
-    # 【关键修正】初始顶点：使用物理价格生成（而不是零向量）
-    # 这样初始顶点就已经是一个合理的解
+    # 【修正】初始顶点：使用零价格向量生成
+    # 这确保初始顶点不是针对特定目标的最优解，允许列生成过程探索
     v_init_individual = np.zeros((N, T))
     for i, device in enumerate(aggregator_virtual.fleet):
-        tcl = tcl_objs[i]
-        gamma_i = np.array([(tcl.a ** t) / tcl.delta for t in range(T)])
-        c_i_virtual = gamma_i * prices  # 设备i的虚拟坐标价格
+        # 使用零价格向量生成初始顶点
+        c_i_virtual = np.zeros(T)
         v_init_individual[i] = device.solve_linear_program(c_i_virtual)
     vertices_individual.append(v_init_individual)
     
@@ -113,7 +112,9 @@ def optimize_cost_column_generation(aggregator_virtual, prices, P0_physical, tcl
     for i in range(N):
         tcl = tcl_objs[i]
         for t in range(T):
-            gamma_it = (tcl.a ** t) / tcl.delta
+            # 【关键修正】使用a^(t+1)与逆变换一致
+            time_index = t + 1
+            gamma_it = (tcl.a ** time_index) / tcl.delta
             v_phys_init[t] += gamma_it * v_init_individual[i, t]
     vertices_physical.append(v_phys_init)
     
@@ -121,7 +122,7 @@ def optimize_cost_column_generation(aggregator_virtual, prices, P0_physical, tcl
     print(f"  初始顶点生成完毕")
     print(f"  [DEBUG] 初始虚拟聚合信号范围: [{v_init.min():.3f}, {v_init.max():.3f}]")
     print(f"  [DEBUG] 初始物理聚合信号范围: [{v_phys_init.min():.3f}, {v_phys_init.max():.3f}]")
-    print(f"  [DEBUG] 初始物理成本={cost_init:.3f} (与Exact Minkowski {46.21:.2f}比较)")
+    print(f"  [DEBUG] 初始物理成本={cost_init:.3f}")
     
     # ===== 步骤2：列生成迭代 =====
     iteration = 0
@@ -159,10 +160,10 @@ def optimize_cost_column_generation(aggregator_virtual, prices, P0_physical, tcl
         best_cost = master.ObjVal
         lambda_opt = np.array([lambda_vars[j].X for j in range(num_vertices)])
         
-        # 获取对偶变量
-        pi = master.getAttr("pi", master.getConstrs())[0] if len(master.getConstrs()) > 0 else 0.0
+        convex_constr = master.getConstrByName("convex_comb")
+        mu = convex_constr.Pi if convex_constr is not None else 0.0
         
-        print(f"  迭代{iteration}: 目标值={best_cost:.3f}, 顶点数={num_vertices}, 对偶={pi:.6f}")
+        print(f"  迭代{iteration}: 目标值={best_cost:.3f}, 顶点数={num_vertices}, μ={mu:.6f}")
         
         # --- 2.2: 求解子问题 ---
         # 【正确的Reduced Cost计算】
@@ -208,7 +209,9 @@ def optimize_cost_column_generation(aggregator_virtual, prices, P0_physical, tcl
         for i in range(N):
             tcl = tcl_objs[i]
             for t in range(T):
-                gamma_it = (tcl.a ** t) / tcl.delta
+                # 【关键修正】使用a^(t+1)与逆变换一致
+                time_index = t + 1
+                gamma_it = (tcl.a ** time_index) / tcl.delta
                 v_phys_new[t] += gamma_it * v_new_individual[i, t]
         
         cost_new = np.sum(prices * (P0_physical + v_phys_new))
@@ -219,19 +222,21 @@ def optimize_cost_column_generation(aggregator_virtual, prices, P0_physical, tcl
             print(f"    [DEBUG] 新顶点物理成本: {cost_new:.3f}")
         
         # 计算改善程度
-        improvement = best_cost - cost_new
-        print(f"    子问题：新顶点成本={cost_new:.3f}, 改善={improvement:.6f}")
+        reduced_cost = cost_new - mu
+        print(f"    子问题：新顶点成本={cost_new:.3f}, ReducedCost={reduced_cost:.6f}")
         
-        # 【调试】第一次迭代时详细输出
         if iteration == 1:
             print(f"    [DEBUG] 当前最优成本: {best_cost:.3f}")
-            print(f"    [DEBUG] 新顶点成本: {cost_new:.3f}")
-            print(f"    [DEBUG] 理论上应该收敛到 Exact Minkowski 的成本 (~46.21)")
+            print(f"    [DEBUG] 对偶μ: {mu:.6f}")
         
-        # 检查收敛（改善不足或迭代上限）
-        if improvement < tolerance or num_vertices > 50:  # 防止顶点过多
-            print(f"  列生成收敛 (改善={improvement:.6e})")
-            print(f"  [INFO] 如果收敛成本远小于46.21，说明子问题求解有误")
+        # 检查收敛（Reduced Cost >= 0 表示无改进列）
+        # 【修正】增加顶点限制并添加相对容差检查
+        relative_gap = abs(reduced_cost) / max(abs(best_cost), 1e-6)
+        if reduced_cost >= -tolerance or num_vertices >= 200:
+            if num_vertices >= 200:
+                print(f"  列生成达到最大顶点数限制 (vertices={num_vertices}, RelGap={relative_gap:.6f})")
+            else:
+                print(f"  列生成收敛 (ReducedCost={reduced_cost:.6e}, RelGap={relative_gap:.6f})")
             break
         
         # 添加新顶点及其分解
@@ -325,7 +330,8 @@ def optimize_peak_column_generation(aggregator_virtual, P0_physical, tcl_objs, T
         u_individual_physical, u_agg_physical = _inverse_transform_to_physical(
             u_individual_virtual, tcl_objs, T
         )
-        peak_value = np.max(P0_physical + u_agg_physical)
+        # 使用L-infinity范数（与algo_exact.py一致）
+        peak_value = np.linalg.norm(P0_physical + u_agg_physical, ord=np.inf)
         return u_individual_physical, u_agg_physical, peak_value
     
     print("  使用列生成算法优化峰值...")
@@ -373,7 +379,9 @@ def optimize_peak_column_generation(aggregator_virtual, P0_physical, tcl_objs, T
         for i in range(N):
             tcl = tcl_objs[i]
             for t in range(T):
-                gamma_it = (tcl.a ** t) / tcl.delta
+                # 【关键修正】使用a^(t+1)与逆变换一致
+                time_index = t + 1
+                gamma_it = (tcl.a ** time_index) / tcl.delta
                 v_phys_init[t] += gamma_it * v_init_individual[i, t]
         vertices_physical.append(v_phys_init)
     
@@ -392,7 +400,7 @@ def optimize_peak_column_generation(aggregator_virtual, P0_physical, tcl_objs, T
         
         num_vertices = len(vertices_virtual)
         lambda_vars = master.addVars(num_vertices, lb=0.0, name="lambda")
-        peak_var = master.addVar(lb=-gp.GRB.INFINITY, name="peak")
+        peak_var = master.addVar(lb=0.0, name="peak")
         
         # 目标：最小化峰值
         master.setObjective(peak_var, GRB.MINIMIZE)
@@ -400,15 +408,12 @@ def optimize_peak_column_generation(aggregator_virtual, P0_physical, tcl_objs, T
         # 约束1：λ的凸组合
         master.addConstr(gp.quicksum(lambda_vars[j] for j in range(num_vertices)) == 1.0, "convex_comb")
         
-        # 约束2：L-infinity在每个时间步
-        # 改写为标准形式: Σ_j λ_j·v_j(t) - z <= -P0(t)
-        # 这样对偶变量π(t)的符号就是正确的
+        # 约束2：L-infinity范数约束 (|P0(t)+Σ_j λ_j·v_j(t)| <= peak_var)
         for k in range(T):
-            lhs = gp.LinExpr()
-            for j in range(num_vertices):
-                lhs += lambda_vars[j] * vertices_physical[j][k]
-            lhs -= peak_var
-            master.addConstr(lhs <= -P0_physical[k], f"linfty_{k}")
+            agg_expr = gp.quicksum(lambda_vars[j] * vertices_physical[j][k] for j in range(num_vertices))
+            total_expr = agg_expr + P0_physical[k]
+            master.addConstr(total_expr - peak_var <= 0, name=f"linfty_upper_{k}")
+            master.addConstr(-total_expr - peak_var <= 0, name=f"linfty_lower_{k}")
         
         master.optimize()
         
@@ -418,28 +423,61 @@ def optimize_peak_column_generation(aggregator_virtual, P0_physical, tcl_objs, T
         
         best_peak = peak_var.X
         lambda_opt = np.array([lambda_vars[j].X for j in range(num_vertices)])
+        convex_constr = master.getConstrByName("convex_comb")
+        mu = convex_constr.Pi if convex_constr is not None else 0.0
         
         # 获取对偶变量（L-infinity约束的对偶）
-        constrs = [master.getConstrByName(f"linfty_{k}") for k in range(T)]
-        pi_vec = master.getAttr("pi", constrs)
-        pi_vec = np.array(pi_vec) if pi_vec else np.zeros(T)
+        # 约束形式：
+        #  (P0 + Σ λ·v) - peak_var <= 0   (对偶 π_upper >= 0)
+        # -(P0 + Σ λ·v) - peak_var <= 0   (对偶 π_lower >= 0)
+        # Reduced Cost: RC = Σ_t (π_upper - π_lower)·v_new(t) - μ
+        # 有效对偶向量: π = π_upper - π_lower
         
-        print(f"  迭代{iteration}: 峰值={best_peak:.3f}, 顶点数={num_vertices}, 对偶range=[{pi_vec.min():.6f}, {pi_vec.max():.6f}]")
+        constrs_upper = [master.getConstrByName(f"linfty_upper_{k}") for k in range(T)]
+        constrs_lower = [master.getConstrByName(f"linfty_lower_{k}") for k in range(T)]
+        
+        # Gurobi对最小化问题的 "<=" 约束返回的Pi通常为非正值
+        # 将它们取相反数以得到标准的非负对偶
+        pi_upper_raw = np.array([c.Pi if c is not None else 0.0 for c in constrs_upper])
+        pi_lower_raw = np.array([c.Pi if c is not None else 0.0 for c in constrs_lower])
+        pi_upper = -pi_upper_raw
+        pi_lower = -pi_lower_raw
+        pi_vec = pi_upper - pi_lower
+        
+        print(f"  迭代{iteration}: 峰值={best_peak:.3f}, 顶点数={num_vertices}, μ={mu:.6f}")
+        print(f"    对偶变量: π_upper range=[{pi_upper.min():.6f}, {pi_upper.max():.6f}]")
+        print(f"    对偶变量: π_lower range=[{pi_lower.min():.6f}, {pi_lower.max():.6f}]")
+        print(f"    有效对偶: π range=[{pi_vec.min():.6f}, {pi_vec.max():.6f}]")
+        
+        # 【调试】第一次迭代时输出更多信息
+        if iteration == 1:
+            print(f"    [DEBUG] P0范围: [{P0_physical.min():.3f}, {P0_physical.max():.3f}]")
+            print(f"    [DEBUG] 对偶变量π (前5个): {pi_vec[:5]}")
+            active_dual = pi_vec[np.abs(pi_vec) > 1e-6]
+            if len(active_dual) > 0:
+                print(f"    [DEBUG] 活跃对偶变量 (|π| > 1e-6): {len(active_dual)}个, 范围=[{active_dual.min():.6f}, {active_dual.max():.6f}]")
         
         # --- 2.2: 求解子问题 ---
-        # 【关键修正】每个设备独立求解虚拟子问题
-        # 物理坐标: u_i^phys(t) = (a_i^t / δ_i) · u_i^virt(t)
-        # 子问题: max Σ_t π(t) · u_i^phys(t) = max Σ_t [(a_i^t / δ_i) · π(t)] · u_i^virt(t)
-        # 转换为最小化: min Σ_t [-(a_i^t / δ_i) · π(t)] · u_i^virt(t)
-        # 所以设备i的虚拟价格向量: c_i^virt(t) = -(a_i^t / δ_i) · π(t)
+        # 【正确的列生成子问题推导】
+        # 主问题: min peak_var, s.t. |P0(t) + Σ_j λ_j·v_j(t)| <= peak_var
+        # 两个不等式约束分别有对偶 π_upper, π_lower >= 0
+        # Reduced Cost: RC = Σ_t (π_upper - π_lower) · v_new(t) - μ
+        # 子问题目标: min Σ_t π_t · v_new(t)，其中 π_t = π_upper_t - π_lower_t
+        # v_new(t) = Σ_i γ_i(t)·ũ_i(t)，⇒ 每个设备的成本是 π_t·γ_i(t)
         
         # 直接为每个设备生成新顶点（Corollary 2实现）
         v_new_individual = np.zeros((N, T))
         for i, device in enumerate(aggregator_virtual.fleet):
             tcl = tcl_objs[i]
             gamma_i = np.array([(tcl.a ** t) / tcl.delta for t in range(T)])
-            c_i_virtual = -gamma_i * pi_vec  # 注意负号:贪心算法求min,但子问题要max
+            c_i_virtual = gamma_i * pi_vec
             v_new_individual[i] = device.solve_linear_program(c_i_virtual)
+            
+            # 【调试】第一次迭代第一个设备时输出
+            if iteration == 1 and i == 0:
+                print(f"    [DEBUG] 设备0: gamma范围=[{gamma_i.min():.3f}, {gamma_i.max():.3f}]")
+                print(f"    [DEBUG] 设备0: c_i_virtual范围=[{c_i_virtual.min():.6f}, {c_i_virtual.max():.6f}]")
+                print(f"    [DEBUG] 设备0: v_new范围=[{v_new_individual[i].min():.3f}, {v_new_individual[i].max():.3f}]")
         
         # 聚合得到新的聚合顶点
         v_new = np.sum(v_new_individual, axis=0)
@@ -449,17 +487,31 @@ def optimize_peak_column_generation(aggregator_virtual, P0_physical, tcl_objs, T
         for i in range(N):
             tcl = tcl_objs[i]
             for t in range(T):
-                gamma_it = (tcl.a ** t) / tcl.delta
+                # 【关键修正】使用a^(t+1)与逆变换一致
+                time_index = t + 1
+                gamma_it = (tcl.a ** time_index) / tcl.delta
                 v_phys_new[t] += gamma_it * v_new_individual[i, t]
         
-        peak_new = np.max(P0_physical + v_phys_new)
+        # 使用L-infinity范数计算峰值（与algo_exact.py一致）
+        peak_new = np.linalg.norm(P0_physical + v_phys_new, ord=np.inf)
         
-        improvement = best_peak - peak_new
-        print(f"    子问题：新顶点峰值={peak_new:.3f}, 改善={improvement:.6f}")
+        reduced_cost = np.dot(pi_vec, v_phys_new) - mu
+        print(f"    子问题：新顶点峰值={peak_new:.3f}, ReducedCost={reduced_cost:.6f}")
         
-        # 检查收敛
-        if improvement < tolerance or num_vertices > 50:
-            print(f"  列生成收敛 (改善={improvement:.6e})")
+        # 【调试】第一次迭代时输出
+        if iteration == 1:
+            print(f"    [DEBUG] v_phys_new范围: [{v_phys_new.min():.3f}, {v_phys_new.max():.3f}]")
+            print(f"    [DEBUG] P0+v_phys_new范围: [{(P0_physical+v_phys_new).min():.3f}, {(P0_physical+v_phys_new).max():.3f}]")
+            print(f"    [DEBUG] 当前最优峰值: {best_peak:.3f}, ReducedCost: {reduced_cost:.6f}")
+        
+        # 检查收敛（Reduced Cost >= 0 表示无改进列）
+        # 【修正】增加顶点限制并添加相对容差检查
+        relative_gap = abs(reduced_cost) / max(abs(best_peak), 1e-6)
+        if reduced_cost >= -tolerance or num_vertices >= 200:
+            if num_vertices >= 200:
+                print(f"  列生成达到最大顶点数限制 (vertices={num_vertices}, RelGap={relative_gap:.6f})")
+            else:
+                print(f"  列生成收敛 (ReducedCost={reduced_cost:.6e}, RelGap={relative_gap:.6f})")
             break
         
         # 添加新顶点
@@ -473,17 +525,17 @@ def optimize_peak_column_generation(aggregator_virtual, P0_physical, tcl_objs, T
     
     num_vertices = len(vertices_virtual)
     lambda_vars_final = final_master.addVars(num_vertices, lb=0.0, name="lambda")
-    peak_var_final = final_master.addVar(lb=-gp.GRB.INFINITY, name="peak")
+    peak_var_final = final_master.addVar(lb=0.0, name="peak")
     
     final_master.setObjective(peak_var_final, GRB.MINIMIZE)
     final_master.addConstr(gp.quicksum(lambda_vars_final[j] for j in range(num_vertices)) == 1.0)
     
+    # L-infinity范数约束（与主问题一致）
     for k in range(T):
-        lhs = gp.LinExpr()
-        for j in range(num_vertices):
-            lhs += lambda_vars_final[j] * vertices_physical[j][k]
-        lhs -= peak_var_final
-        final_master.addConstr(lhs <= -P0_physical[k], f"linfty_{k}")
+        agg_expr = gp.quicksum(lambda_vars_final[j] * vertices_physical[j][k] for j in range(num_vertices))
+        total_expr = agg_expr + P0_physical[k]
+        final_master.addConstr(total_expr - peak_var_final <= 0, name=f"linfty_upper_{k}")
+        final_master.addConstr(-total_expr - peak_var_final <= 0, name=f"linfty_lower_{k}")
     
     final_master.optimize()
     
@@ -578,8 +630,10 @@ def _inverse_transform_to_physical(u_individual_virtual, tcl_objs, T):
         
         u_phys_i = np.zeros(T)
         for t in range(T):
-            # 逆变换: u_phys[t] = (a^t / δ) · ũ_virt[t]
-            scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
+            # 【修正】逆变换: u_phys[t] = (a^(t+1) / δ) · ũ_virt[t]
+            # 与正向变换一致: ũ[t] = δ·u[t] / a^(t+1)
+            time_index = t + 1
+            scale = (a_i ** time_index) / delta_i if delta_i > 1e-10 else 1.0
             u_phys_i[t] = u_individual_virtual[i, t] * scale
         
         u_individual_physical.append(u_phys_i)

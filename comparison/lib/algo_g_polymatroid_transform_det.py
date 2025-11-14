@@ -53,7 +53,9 @@ def _solve_cost_optimization(aggregator, prices, P0_agg, T, tcl_objs):
         a_i = tcl.a
         delta_i = tcl.delta
         for t in range(T):
-            scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
+            # 【修正】使用a^(t+1)与正向变换一致
+            time_index = t + 1
+            scale = (a_i ** time_index) / delta_i if delta_i > 1e-10 else 1.0
             u0_virtual_individual[i, t] = u0_physical_individual[i, t] / scale if abs(scale) > 1e-10 else 0.0
     
     # 虚拟聚合信号
@@ -84,7 +86,9 @@ def _solve_peak_optimization(aggregator, P0_agg, tcl_objs, T):
         a_i = tcl.a
         delta_i = tcl.delta
         for t in range(T):
-            scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
+            # 【修正】使用a^(t+1)与正向变换一致
+            time_index = t + 1
+            scale = (a_i ** time_index) / delta_i if delta_i > 1e-10 else 1.0
             u0_virtual_individual[i, t] = u0_physical_individual[i, t] / scale if abs(scale) > 1e-10 else 0.0
     
     u0_virtual_agg = np.sum(u0_virtual_individual, axis=0)
@@ -165,39 +169,70 @@ def solve(data: dict, tcl_objs: List = None, objective='cost') -> dict:
         u_min_phys = -P0_i
         u_max_phys = tcl.P_m - P0_i
         
-        # 虚拟功率边界: ũ(t) = δ·u(t)/a^t
+        # 虚拟功率边界: ũ(k) = δ·u(k)/a^k (TEX Eq. 4)
+        # 
+        # 【关键】时间索引约定（方案B，与虚拟状态边界一致）:
+        # - TEX公式: k ∈ {1, 2, ..., T}
+        # - Python: t ∈ {0, 1, ..., T-1}
+        # - 映射: t对应TEX中的k=t+1
+        # 
+        # 因此: ũ[t] = δ·u[t] / a^(t+1)
+        # 
+        # 这与虚拟状态约束的索引一致：
+        # - x̃[t+1] = x[t+1] / a^(t+1)
+        # - x̃[t+1] = x̃[t] + ũ[t]
         u_min_virt = np.zeros(T)
         u_max_virt = np.zeros(T)
         for t in range(T):
-            scale = delta / (a ** t) if abs(a ** t) > 1e-10 else delta
+            time_index = t + 1  # TEX中的k
+            scale = delta / (a ** time_index) if abs(a ** time_index) > 1e-10 else delta
             u_min_virt[t] = u_min_phys[t] * scale
             u_max_virt[t] = u_max_phys[t] * scale
         
-        # 虚拟状态约束修正!
-        # 物理: x(t) = a^t·x0 + δ·Σ_{s=0}^{t-1} a^{t-1-s}·u(s)
-        # 虚拟: x̃(t) = x(t)/a^t = x0 + Σ_{s=0}^{t-1} ũ(s)
+        # 【关键修正】虚拟状态约束 - 严格遵循TEX文件公式
         # 
-        # 物理约束: -x_plus <= x(t) <= x_plus (对所有t)
-        # ∴ 虚拟约束: -x_plus/a^t <= x̃(t) <= x_plus/a^t
-        # ∴ 累积约束: -x_plus/a^t - x0 <= Σ_{s=0}^{t-1} ũ(s) <= x_plus/a^t - x0
-        #
-        # GeneralDER中的x_min[t]表示Σ_{s=0}^{t} ũ(s)(包括第t个)的范围
-        # 但这里我们保持与GeneralDER一致:
-        # x_min[t] = -x_plus/a^(t+1) - x0 (至时刻t的累积,对应虚拟状态x̃(t+1))
-        # x_max[t] = x_plus/a^(t+1) - x0
-        #
-        # 关键修正: 确保约束严格来自**物理状态约束**,不混合功率累积
+        # === 物理模型 (TEX Eq. 1) ===
+        # x(k) = a·x(k-1) + δ·u(k)
+        # 展开: x(t) = a^t·x(0) + δ·Σ_{k=1}^{t} a^(t-k)·u(k)
+        # 
+        # === 虚拟坐标变换 (TEX Eq. 3, 4) ===
+        # x̃(t) := x(t) / a^t
+        # ũ(k) := δ·u(k) / a^k
+        # 
+        # === 虚拟动力学 (TEX Eq. 5) ===
+        # x̃(t) = x̃(t-1) + ũ(t)  (无损系统!)
+        # 展开: x̃(t) = x̃(0) + Σ_{k=1}^{t} ũ(k)
+        # 
+        # === 虚拟状态约束 (TEX Section 3.1) ===
+        # 物理约束: -x_plus <= x(t) <= x_plus
+        # 除以a^t: -x_plus/a^t <= x̃(t) <= x_plus/a^t
+        # 代入展开式: -x_plus/a^t <= x̃(0) + Σ_{k=1}^{t} ũ(k) <= x_plus/a^t
+        # 移项: -x_plus/a^t - x̃(0) <= Σ_{k=1}^{t} ũ(k) <= x_plus/a^t - x̃(0)
+        # 
+        # === GeneralDER约定 ===
+        # x_min[t] 和 x_max[t] 表示累积和 Σ_{k=1}^{t+1} ũ(k) 的边界
+        # 即：x_min[t] <= Σ_{k=1}^{t+1} ũ(k) <= x_max[t]
+        # 这对应虚拟状态 x̃(t+1) - x̃(0)
+        # 
+        # 因此正确的映射是:
+        # x_min[t] = -x_plus/a^(t+1) - x̃(0)
+        # x_max[t] = x_plus/a^(t+1) - x̃(0)
+        # 
+        # 注意: x̃(0) = x(0) = x0 (初始状态)
         
         y_lower_virt = np.zeros(T)
         y_upper_virt = np.zeros(T)
         
         for t in range(T):
-            # GeneralDER期望x_min[t], x_max[t]表示Σ_{s=0}^{t} ũ(s)的范围
-            # 这对应虚拟状态在时刻t+1: x̃(t+1) = x0 + Σ_{s=0}^{t} ũ(s)
-            # 由物理约束: -x_plus/a^(t+1) <= x̃(t+1) <= x_plus/a^(t+1)
-            # 所以: -x_plus/a^(t+1) - x0 <= Σ_{s=0}^{t} ũ(s) <= x_plus/a^(t+1) - x0
+            # t 从 0 到 T-1
+            # x_min[t] 对应 Σ_{k=1}^{t+1} ũ(k)，即虚拟状态 x̃(t+1)
+            # 物理约束在时刻 t+1: -x_plus <= x(t+1) <= x_plus
+            # 虚拟形式: -x_plus/a^(t+1) <= x̃(t+1) <= x_plus/a^(t+1)
             
-            power_denom = a ** (t+1) if abs(a ** (t+1)) > 1e-10 else 1e-10
+            time_index = t + 1  # 对应物理时刻
+            power_denom = a ** time_index if abs(a ** time_index) > 1e-10 else 1e-10
+            
+            # TEX公式: x̃_lower(t) = x_lower(t)/a^t - x̃(0)
             y_lower_virt[t] = -x_plus / power_denom - x0
             y_upper_virt[t] = x_plus / power_denom - x0
         
@@ -216,7 +251,9 @@ def solve(data: dict, tcl_objs: List = None, objective='cost') -> dict:
             print(f"  [DEBUG] TCL 0: 创建 CorrectTCL_GPoly 实例")
             print(f"  [DEBUG] TCL 0 虚拟功率边界: u_min_virt=[{u_min_virt.min():.3f}, {u_min_virt.max():.3f}], u_max_virt=[{u_max_virt.min():.3f}, {u_max_virt.max():.3f}]")
             print(f"  [DEBUG] TCL 0 虚拟能量边界: y_lower_virt=[{y_lower_virt.min():.3f}, {y_lower_virt.max():.3f}], y_upper_virt=[{y_upper_virt.min():.3f}, {y_upper_virt.max():.3f}]")
-            print(f"  [DEBUG] TCL 0 物理参数: a={a:.4f}, delta={tcl.delta:.4f}, x_plus={x_plus:.2f}")
+            print(f"  [DEBUG] TCL 0 物理参数: a={a:.4f}, delta={delta:.4f}, x0={x0:.4f}, x_plus={x_plus:.2f}")
+            print(f"  [DEBUG] TCL 0 物理功率范围: u_min_phys=[{u_min_phys.min():.3f}, {u_min_phys.max():.3f}], u_max_phys=[{u_max_phys.min():.3f}, {u_max_phys.max():.3f}]")
+            print(f"  [DEBUG] TCL 0 物理状态约束: x ∈ [{-x_plus:.2f}, {x_plus:.2f}]")
         
         tcl_virtual_list.append(tcl_virtual)
     
@@ -283,7 +320,10 @@ def solve(data: dict, tcl_objs: List = None, objective='cost') -> dict:
         
         u_phys_i = np.zeros(T)
         for t in range(T):
-            scale = (a_i ** t) / delta_i if delta_i > 1e-10 else 1.0
+            # 【修正】逆变换: u[t] = (a^(t+1) / δ) · ũ[t]
+            # 与正向变换一致: ũ[t] = δ·u[t] / a^(t+1)
+            time_index = t + 1
+            scale = (a_i ** time_index) / delta_i if delta_i > 1e-10 else 1.0
             u_phys_i[t] = u_virt_i[t] * scale
         
         u0_physical_individual.append(u_phys_i)
@@ -299,15 +339,106 @@ def solve(data: dict, tcl_objs: List = None, objective='cost') -> dict:
     # 转换为实际功率
     P_total = u0_physical_agg + P0_agg
     
+    # 【关键验证】检查每个TCL的物理约束是否满足
+    print("\n--- 阶段7: 物理约束验证 ---")
+    all_constraints_satisfied = True
+    constraint_violations = []
+    
+    # 从data中获取个体基线功率（如果有的话）
+    P0_individual = data.get('demands', None)  # (T, N) 格式
+    if P0_individual is not None:
+        P0_individual = P0_individual.T  # 转换为 (N, T) 格式
+    
+    for i, tcl in enumerate(tcl_objs):
+        u_phys_i = u0_physical_individual[i]  # 物理控制信号
+        
+        # 获取个体基线功率
+        if P0_individual is not None:
+            P0_i = P0_individual[i]
+        else:
+            # 如果没有提供，根据TCL参数重新计算
+            theta_a = tcl.tcl_params.get('theta_a_forecast', data.get('theta_a_forecast', np.zeros(T)))
+            theta_r = tcl.tcl_params['theta_r']
+            b_coef = tcl.tcl_params['R_th'] * tcl.tcl_params['eta']
+            P0_i = np.maximum(0, (theta_a - theta_r) / b_coef)
+        
+        P_i = u_phys_i + P0_i  # 总功率
+        
+        # 获取TCL参数
+        params = tcl.tcl_params
+        a = params['a']
+        delta = params['delta']
+        P_m = params['P_m']
+        P_min = params.get('P_min', 0.0)
+        x0 = params.get('x0', 0.0)
+        
+        # 计算物理状态边界
+        x_plus = (params['C_th'] * params['delta_val']) / params['eta'] if params['eta'] > 0 else 0
+        x_min_phys = -x_plus
+        x_max_phys = x_plus
+        
+        # 1. 功率边界约束：P_min <= P_i[t] <= P_m
+        power_min_violations = np.sum(P_i < P_min - 1e-6)
+        power_max_violations = np.sum(P_i > P_m + 1e-6)
+        
+        # 2. 状态约束：通过动力学方程计算状态轨迹
+        x_trajectory = np.zeros(T + 1)
+        x_trajectory[0] = x0
+        state_violations = 0
+        
+        for t in range(T):
+            x_trajectory[t + 1] = a * x_trajectory[t] + delta * u_phys_i[t]
+            if x_trajectory[t + 1] < x_min_phys - 1e-6 or x_trajectory[t + 1] > x_max_phys + 1e-6:
+                state_violations += 1
+        
+        # 统计违反情况
+        total_violations = power_min_violations + power_max_violations + state_violations
+        
+        if total_violations > 0:
+            all_constraints_satisfied = False
+            violation_info = {
+                'tcl_id': i,
+                'power_min_violations': int(power_min_violations),
+                'power_max_violations': int(power_max_violations),
+                'state_violations': int(state_violations),
+                'P_i_min': float(P_i.min()),
+                'P_i_max': float(P_i.max()),
+                'P_min': float(P_min),
+                'P_m': float(P_m),
+                'x_min': float(x_trajectory.min()),
+                'x_max': float(x_trajectory.max()),
+                'x_min_phys': float(x_min_phys),
+                'x_max_phys': float(x_max_phys)
+            }
+            constraint_violations.append(violation_info)
+    
+    # 输出验证结果
+    if all_constraints_satisfied:
+        print(f"[OK] 所有 {N} 个TCL的物理约束均满足")
+    else:
+        print(f"[FAIL] 发现约束违反！{len(constraint_violations)}/{N} 个TCL违反约束")
+        for violation in constraint_violations[:5]:  # 只显示前5个
+            print(f"  TCL {violation['tcl_id']}:")
+            if violation['power_min_violations'] > 0:
+                print(f"    功率下界违反: {violation['power_min_violations']}次, P_i_min={violation['P_i_min']:.4f} < P_min={violation['P_min']:.4f}")
+            if violation['power_max_violations'] > 0:
+                print(f"    功率上界违反: {violation['power_max_violations']}次, P_i_max={violation['P_i_max']:.4f} > P_m={violation['P_m']:.4f}")
+            if violation['state_violations'] > 0:
+                print(f"    状态约束违反: {violation['state_violations']}次, x范围=[{violation['x_min']:.4f}, {violation['x_max']:.4f}], 限制=[{violation['x_min_phys']:.4f}, {violation['x_max_phys']:.4f}]")
+        if len(constraint_violations) > 5:
+            print(f"  ... 还有 {len(constraint_violations) - 5} 个TCL违反约束")
+    
     # 8. 计算指标
     total_cost = np.dot(prices, P_total)
-    peak_power = np.max(P_total)
+    # 【关键修正】峰值功率应该使用L-infinity范数（绝对值的最大值），与Exact和No-Flex一致
+    peak_power = np.linalg.norm(P_total, ord=np.inf)  # max(abs(P_total))
     computation_time = time.time() - start_time
     
     print("\n" + "="*80)
     print(f"确定性坐标变换算法完成 (目标: {objective})")
     print(f"总成本: {total_cost:.2f}")
     print(f"峰值功率: {peak_power:.2f}")
+    print(f"约束满足: {'是' if all_constraints_satisfied else '否 (不可行解!)'}")
     print(f"计算时间: {computation_time:.3f}s")
     print("="*80)
     
@@ -318,7 +449,9 @@ def solve(data: dict, tcl_objs: List = None, objective='cost') -> dict:
         'peak_power': peak_power,
         'computation_time': computation_time,
         'objective': objective,
-        'algorithm': f'G-Polymatroid-Transform-Det-{objective.upper()}'
+        'algorithm': f'G-Polymatroid-Transform-Det-{objective.upper()}',
+        'constraints_satisfied': all_constraints_satisfied,
+        'constraint_violations': constraint_violations
     }
 
 
