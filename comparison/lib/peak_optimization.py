@@ -38,10 +38,13 @@
 3. 最终：通过最优λ得到最优ũ_agg，分解+逆变换得到物理坐标结果
 
 """
+import os
+import time
 import numpy as np
+import concurrent.futures as cf
 
 
-def optimize_cost_column_generation(aggregator_virtual, prices, P0_physical, tcl_objs, T, max_iterations=100, tolerance=1e-3):
+def optimize_cost_column_generation(aggregator_virtual, prices, P0_physical, tcl_objs, T, max_iterations=200, tolerance=1e-2):
     """
     使用列生成算法优化物理成本
     
@@ -289,7 +292,7 @@ def optimize_cost_column_generation(aggregator_virtual, prices, P0_physical, tcl
     return u_individual_physical, u_phys_agg_opt, total_cost
 
 
-def optimize_peak_column_generation(aggregator_virtual, P0_physical, tcl_objs, T, max_iterations=100, tolerance=1e-3):
+def optimize_peak_column_generation(aggregator_virtual, P0_physical, tcl_objs, T, max_iterations=200, tolerance=1e-2):
     """
     使用列生成算法优化物理L-infinity目标（峰值）
     
@@ -338,27 +341,39 @@ def optimize_peak_column_generation(aggregator_virtual, P0_physical, tcl_objs, T
     
     N = len(tcl_objs)
     
-    # ===== 步骤1：初始化 - 生成多个初始顶点 =====
+    # ===== 步骤1：启发式温启动 - 生成T+2个智能顶点 =====
+    # 
+    # 【优化温启动策略】减少初始顶点数以加速
+    # 
+    # 从2T+2减少到T+2个"智能"顶点:
+    # - v1: 全局最大充电 (降低整体峰值)
+    # - v2: 全局最小充电 (对比基准)
+    # - v3...v_{T+2}: 只在时间t最大充电 (T个单时刻峰值抑制顶点)
+    # 
+    # 效果: 减少温启动时间，同时保留关键顶点
+    # 
     vertices_virtual = []
     vertices_physical = []
     vertices_individual = []  # 存储个体顶点分解 v_ij (Corollary 2)
     
-    # 【策略修正】生成多个初始顶点以覆盖不同的极端情况
-    # 1. 最小化所有功率 (尽可能使用负功率降低峰值)
-    # 2. 针对每个时间步单独优化 (降低该时间步的峰值)
+    print("  [温启动] 生成T+2个智能初始顶点...")
     
-    initial_prices = [
-        -np.ones(T),  # 全局最小化
-        np.ones(T),   # 全局最大化 (作为对比)
-    ]
+    initial_prices = []
     
-    # 为前几个高峰时间步生成专门的初始顶点
-    # 找出P0最大的几个时间步
-    peak_times = np.argsort(P0_physical)[-3:]  # 最高的3个时间步
-    for t_peak in peak_times:
-        c_targeted = np.zeros(T)
-        c_targeted[t_peak] = -10.0  # 专门降低这个时间步的功率
-        initial_prices.append(c_targeted)
+    # v1: 全局最大充电 (所有时间步都尽量降低功率)
+    initial_prices.append(-np.ones(T) * 10.0)
+    
+    # v2: 全局最小充电 (对比基准,探索边界)
+    initial_prices.append(np.ones(T) * 10.0)
+    
+    # v3...v_{T+2}: 单时刻最大充电顶点
+    # 为每个时间步t生成一个"只在t时刻大力降低功率"的顶点
+    for t in range(T):
+        c_t = np.zeros(T)
+        c_t[t] = -100.0  # 只在时间t给予强负价格,鼓励降低该时刻峰值
+        initial_prices.append(c_t)
+    
+    print(f"  [温启动] 共{len(initial_prices)}个初始价格向量 (T+2={T+2})")
     
     for c_init in initial_prices:
         # 直接为每个设备生成个体顶点（Corollary 2实现）

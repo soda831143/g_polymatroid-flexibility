@@ -17,6 +17,16 @@ import numpy as np # 导入 NumPy 库，用于高效的数值计算，特别是�
 from . import parameter_sampling as sample # 从当前包（devices）导入 parameter_sampling.py 文件，并赋予别名 sample。
 from flexitroid.flexitroid import Flexitroid # 从 flexitroid 包的 flexitroid.py 文件导入 Flexitroid 抽象基类。
 
+# 尝试导入 Cython 加速版本
+try:
+    from flexitroid.cython.b_fast import b_fast
+    from flexitroid.cython.p_fast import p_fast
+    USE_CYTHON = True
+    print("[Cython] 成功加载 b_fast 和 p_fast，使用加速版本")
+except ImportError:
+    USE_CYTHON = False
+    print("[Cython] 未找到编译的 Cython 模块，使用纯 Python 版本")
+
 
 @dataclass
 class DERParameters:
@@ -120,6 +130,11 @@ class GeneralDER(Flexitroid):
         # 逐个与当前的多面体求交集来更新 b 函数。
         # 详细的推导和对应关系见于论文的附录A和D [cite: 284, 313]。
 
+        # 【Cython加速】如果可用，使用编译的C版本（10-100倍加速）
+        if USE_CYTHON:
+            return b_fast(A, self.T, self.active, 
+                         self.params.u_min, self.params.u_max,
+                         self.params.x_min, self.params.x_max)
 
         # 首先计算 A 的补集 A_c，即所有时间步的集合减去 A。即 T \ A。
         A_c = self.active - A
@@ -174,6 +189,13 @@ class GeneralDER(Flexitroid):
         # 它是在考虑了所有时间步的功率和SoC约束后，集合 A 内的总消耗量的下界。
         # 实现逻辑与 b(A) 非常相似，只是 min/max 和约束上下限的角色互换。
         # 同样基于论文 Lemma 1[cite: 142], Corollary 1 [cite: 158] 及附录的推导 [cite: 284, 313]。
+        
+        # 【Cython加速】如果可用，使用编译的C版本（10-100倍加速）
+        if USE_CYTHON:
+            return p_fast(A, self.T, self.active,
+                         self.params.u_min, self.params.u_max,
+                         self.params.x_min, self.params.x_max)
+        
         A_c = self.active - A
         # 初始化 p_val 为在集合 A 内只考虑功率下限时的最小消耗量。
         # 这相当于递归定义中的 p^0(A) = sum_{t in A} u_min(t)。

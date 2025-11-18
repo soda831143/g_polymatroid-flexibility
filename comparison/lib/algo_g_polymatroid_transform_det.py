@@ -22,11 +22,27 @@ if project_root not in sys.path:
 from flexitroid.aggregations.aggregator import Aggregator
 from flexitroid.devices.tcl import TCL
 from flexitroid.devices.general_der import GeneralDER, DERParameters
-from .peak_optimization import optimize_cost_column_generation, optimize_peak_column_generation
-from .correct_tcl_gpoly import CorrectTCL_GPoly  # 【关键修正】使用正确的p/b实现
+
+# 【导入策略】始终导入串行版本，有条件导入并行版本
+from .peak_optimization import (
+    optimize_cost_column_generation,
+    optimize_peak_column_generation
+)
+
+try:
+    from .peak_optimization_parallel import (
+        optimize_cost_column_generation_parallel,
+        optimize_peak_column_generation_parallel
+    )
+    PARALLEL_AVAILABLE = True
+except ImportError:
+    print("[WARNING] 并行化模块导入失败，仅使用串行版本")
+    PARALLEL_AVAILABLE = False
+
+from .correct_tcl_gpoly import CorrectTCL_GPoly  # 使用快速DP算法计算p/b
 
 
-def _solve_cost_optimization(aggregator, prices, P0_agg, T, tcl_objs):
+def _solve_cost_optimization(aggregator, prices, P0_agg, T, tcl_objs, use_parallel=True):
     """
     成本优化：使用列生成框架
     
@@ -41,10 +57,21 @@ def _solve_cost_optimization(aggregator, prices, P0_agg, T, tcl_objs):
     1. 主问题：在F_agg的顶点凸组合上优化物理成本
     2. 子问题：通过贪心算法生成改善顶点
     3. 迭代直到收敛
+    
+    【性能优化】：使用并行化版本加速子问题求解
+    
+    Args:
+        use_parallel: 是否使用并行化（默认True）
     """
-    u0_physical_individual, u0_physical_agg, total_cost = optimize_cost_column_generation(
-        aggregator, prices, P0_agg, tcl_objs, T
-    )
+    # 使用并行化或串行版本
+    if PARALLEL_AVAILABLE and use_parallel:
+        u0_physical_individual, u0_physical_agg, total_cost = optimize_cost_column_generation_parallel(
+            aggregator, prices, P0_agg, tcl_objs, T
+        )
+    else:
+        u0_physical_individual, u0_physical_agg, total_cost = optimize_cost_column_generation(
+            aggregator, prices, P0_agg, tcl_objs, T
+        )
     
     # 从物理个体信号反推虚拟个体信号（用于其他需要虚拟信号的地方）
     N = len(tcl_objs)
@@ -64,7 +91,7 @@ def _solve_cost_optimization(aggregator, prices, P0_agg, T, tcl_objs):
     return u0_virtual_individual, u0_virtual_agg
 
 
-def _solve_peak_optimization(aggregator, P0_agg, tcl_objs, T):
+def _solve_peak_optimization(aggregator, P0_agg, tcl_objs, T, prices=None, use_parallel=True):
     """
     峰值优化：使用列生成框架
     
@@ -74,10 +101,23 @@ def _solve_peak_optimization(aggregator, P0_agg, tcl_objs, T):
     - 物理峰值：P_peak = max_t(P0[t] + Σ_i (γ_i[t]·ũ_i[t]))
     - 可行集：ũ_agg = Σ_i ũ_i ∈ F_agg
     - 同样需要列生成来保证物理最优
+    
+    【性能优化】：使用智能温启动+并行化加速
+    - 智能温启动：2T+3个启发式顶点（需要prices用于"Min Energy"顶点）
+    - 并行化：N个子问题并行求解
+    
+    Args:
+        use_parallel: 是否使用并行化（默认True）
     """
-    u0_physical_individual, u0_physical_agg, peak_value = optimize_peak_column_generation(
-        aggregator, P0_agg, tcl_objs, T
-    )
+    # 使用并行化或串行版本
+    if PARALLEL_AVAILABLE and use_parallel:
+        u0_physical_individual, u0_physical_agg, peak_value = optimize_peak_column_generation_parallel(
+            aggregator, P0_agg, tcl_objs, T, prices=prices
+        )
+    else:
+        u0_physical_individual, u0_physical_agg, peak_value = optimize_peak_column_generation(
+            aggregator, P0_agg, tcl_objs, T
+        )
     
     # 从物理信号反推虚拟信号
     N = len(tcl_objs)
@@ -96,7 +136,7 @@ def _solve_peak_optimization(aggregator, P0_agg, tcl_objs, T):
     return u0_virtual_individual, u0_virtual_agg
 
 
-def solve(data: dict, tcl_objs: List = None, objective='cost') -> dict:
+def solve(data: dict, tcl_objs: List = None, objective='cost', use_parallel=False) -> dict:
     """
     确定性坐标变换G-Polymatroid聚合算法
     
@@ -116,6 +156,7 @@ def solve(data: dict, tcl_objs: List = None, objective='cost') -> dict:
             - 'households': TCL数量
         tcl_objs: TCL对象列表(可选)
         objective: 优化目标 ('cost' 或 'peak')
+        use_parallel: 是否使用并行化加速（默认False，因为可能有开销）
     
     Returns:
         结果字典 {
@@ -236,15 +277,15 @@ def solve(data: dict, tcl_objs: List = None, objective='cost') -> dict:
             y_lower_virt[t] = -x_plus / power_denom - x0
             y_upper_virt[t] = x_plus / power_denom - x0
         
-        # 【关键修正】使用正确的p/b实现,而不是GeneralDER的DP算法
-        # GeneralDER的DP算法无法正确处理指数衰减的虚拟边界
+        # 【高性能】使用快速DP算法计算p/b,而不是慢速LP
+        # 虚拟空间是无损的,GeneralDER的DP算法完全正确且极快!
         params_virtual = DERParameters(
             u_min=u_min_virt,
             u_max=u_max_virt,
             x_min=y_lower_virt,
             x_max=y_upper_virt
         )
-        tcl_virtual = CorrectTCL_GPoly(params_virtual)  # 使用显式LP求解p/b
+        tcl_virtual = CorrectTCL_GPoly(params_virtual)  # 使用快速DP算法(O(T)复杂度)
         
         # 【调试】第一个TCL时输出虚拟边界信息
         if i == 0:
@@ -275,9 +316,9 @@ def solve(data: dict, tcl_objs: List = None, objective='cost') -> dict:
     u0_virtual_agg = np.zeros(T)
     
     if objective == 'cost':
-        print("目标: 最小化成本")
+        print(f"目标: 最小化成本 (并行化={'开启' if use_parallel else '关闭'})")
         u0_virtual_individual_cost, u0_virtual_agg_cost = _solve_cost_optimization(
-            agg_virtual, prices, P0_agg, T, tcl_objs
+            agg_virtual, prices, P0_agg, T, tcl_objs, use_parallel=use_parallel
         )
         print("成本优化完成 (使用列生成框架)")
         
@@ -286,9 +327,10 @@ def solve(data: dict, tcl_objs: List = None, objective='cost') -> dict:
         u0_virtual_agg = u0_virtual_agg_cost
         
     elif objective == 'peak':
-        print("目标: 最小化峰值功率")
+        print(f"目标: 最小化峰值功率 (并行化={'开启' if use_parallel else '关闭'})")
+        # 【性能优化】传入prices用于智能温启动（生成"Min Energy"顶点）
         u0_virtual_individual_peak, u0_virtual_agg_peak = _solve_peak_optimization(
-            agg_virtual, P0_agg, tcl_objs, T
+            agg_virtual, P0_agg, tcl_objs, T, prices=prices, use_parallel=use_parallel
         )
         print("峰值优化完成 (使用列生成框架)")
         

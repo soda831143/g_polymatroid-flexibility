@@ -185,21 +185,21 @@ ALL_ALGORITHMS = {
     'Zonotope': algo_Zonotope,
     'Barot Inner': algo_Barot_Inner,
     'Inner Affine': algo_Inner_affine,
-    'G-Poly-Transform-Det': algo_g_polymatroid_transform_det,  # 确定性坐标变换 (新框架)
+    'G-Poly-Transform-Det': algo_g_polymatroid_transform_det,  # 确定性坐标变换 (使用快速DP)
     'JCC-SRO': algo_g_polymatroid_jcc_sro,                     # JCC-SRO (单阶段,坐标变换)
     'JCC-Re-SRO': algo_g_polymatroid_jcc_resro                 # JCC-Re-SRO (两阶段,坐标变换)
 }
 
 # 算法启用配置 - 设置为True以启用该算法
 ALGORITHM_ENABLE = {
-    'Exact Minkowski': True,      # 精确Minkowski和 (基准)
-    'No Flexibility': True,       # 无灵活性 (基准)
-    'Barot Outer': False,          # 传统算法
-    'Inner Homothets': False,      # 传统算法
-    'Zonotope': False,             # 传统算法
-    'Barot Inner': False,          # 传统算法
-    'Inner Affine': False,         # 传统算法
-    'G-Poly-Transform-Det': True, # 【新】确定性g-polymatroid (坐标变换)
+    'Exact Minkowski': True,       # 精确Minkowski和 (基准)
+    'No Flexibility': True,        # 无灵活性 (基准)
+    'Barot Outer': True,          # 传统算法
+    'Inner Homothets': True,      # 传统算法
+    'Zonotope': True,             # 传统算法
+    'Barot Inner': True,          # 传统算法
+    'Inner Affine': True,         # 传统算法
+    'G-Poly-Transform-Det': True,  # 【新】确定性g-polymatroid (使用快速DP)
     'JCC-SRO': False,              # 【新】JCC-SRO (鲁棒优化)
     'JCC-Re-SRO': False            # 【新】JCC-Re-SRO (两阶段鲁棒优化)
 }
@@ -274,7 +274,7 @@ def run_algorithm(algo_name, algo_module, data, objective=None):
             if objective is None:
                 raise ValueError(f"{algo_name} 必须指定 objective 参数")
             
-            result = algo_module.solve(data, objective=objective)
+            result = algo_module.solve(data, objective=objective, use_parallel=True)
             total_time = time.time() - start_time
             cost = result.get('total_cost', np.nan)
             peak = result.get('peak_power', np.nan)
@@ -362,8 +362,8 @@ def calculate_and_save_upr(df, algorithms, output_dir):
     
     # 计算平均UPR并显示
     print("\n结果汇总:")
-    print(f"{'算法':<25} {'成本UPR (%)':<15} {'峰值UPR (%)':<15} {'总时间 (s)':<15}")
-    print("-" * 70)
+    print(f"{'算法':<25} {'成本UPR (%)':<15} {'峰值UPR (%)':<15} {'成本时间 (s)':<15} {'峰值时间 (s)':<15}")
+    print("-" * 95)
     
     summary = []
     for name in algorithms:
@@ -372,14 +372,16 @@ def calculate_and_save_upr(df, algorithms, output_dir):
         
         avg_cost_upr = df[f'{name}_cost_upr'].mean()
         avg_peak_upr = df[f'{name}_peak_upr'].mean()
-        avg_time = df[f'{name}_total_time'].mean()
+        avg_cost_time = df[f'{name}_cost_time'].mean()
+        avg_peak_time = df[f'{name}_peak_time'].mean()
         
-        print(f"{name:<25} {avg_cost_upr:<15.2f} {avg_peak_upr:<15.2f} {avg_time:<15.3f}")
+        print(f"{name:<25} {avg_cost_upr:<15.2f} {avg_peak_upr:<15.2f} {avg_cost_time:<15.3f} {avg_peak_time:<15.3f}")
         summary.append({
             'Algorithm': name, 
             'Cost_UPR': avg_cost_upr, 
             'Peak_UPR': avg_peak_upr, 
-            'Total_Time': avg_time
+            'Cost_Time': avg_cost_time,
+            'Peak_Time': avg_peak_time
         })
     
     # 保存结果
@@ -410,59 +412,68 @@ def run_advanced_comparison(num_samples, num_households, periods, num_days, num_
     print(f"聚合基线功率P0范围: [{data['P0'].min():.1f}, {data['P0'].max():.1f}] kW")
     
     # 2. 为JCC算法准备温度误差数据
-    print("\n--- 准备不确定性数据 (JCC-SRO/Re-SRO) ---")
+    # 【修改】仅在需要JCC算法时才生成数据
+    ALGORITHMS = get_enabled_algorithms()
+    need_uncertainty_data = any(name in JCC_ALGOS for name in ALGORITHMS.keys())
     
-    # 检查是否需要生成温度误差数据
-    file_suffix = "_summer"
-    shape_file = f'omega_shape_set{file_suffix}.npy'
-    calib_file = f'omega_calibration_set{file_suffix}.npy'
-    
-    if not all(os.path.exists(f) for f in [shape_file, calib_file]):
-        print("需要生成温度误差数据...")
+    if need_uncertainty_data:
+        print("\n--- 准备不确定性数据 (JCC-SRO/Re-SRO) ---")
         
-        # 生成夏季温度数据
-        if not os.path.exists('summer_temps_by_day.npy'):
-            from flexitroid.utils.extract_summer_high_temp_dataset import main as extract
-            print("生成夏季温度原始数据...")
-            extract()
+        # 检查是否需要生成温度误差数据
+        file_suffix = "_summer"
+        shape_file = f'omega_shape_set{file_suffix}.npy'
+        calib_file = f'omega_calibration_set{file_suffix}.npy'
         
-        # 生成地面真实数据
-        generate_ground_truth_data_summer(
-            num_tcls=num_tcls, 
-            t_horizon=t_horizon, 
-            num_days=num_days, 
-            use_summer_data=True
-        )
+        if not all(os.path.exists(f) for f in [shape_file, calib_file]):
+            print("需要生成温度误差数据...")
+            
+            # 生成夏季温度数据
+            if not os.path.exists('summer_temps_by_day.npy'):
+                from flexitroid.utils.extract_summer_high_temp_dataset import main as extract
+                print("生成夏季温度原始数据...")
+                extract()
+            
+            # 生成地面真实数据
+            generate_ground_truth_data_summer(
+                num_tcls=num_tcls, 
+                t_horizon=t_horizon, 
+                num_days=num_days, 
+                use_summer_data=True
+            )
+            
+            # 加载温度误差数据
+            omega_combined = np.load('summer_all_errors_yesterday.npy')
+            
+            # 生成数据集 (针对SRO和Re-SRO分别准备)
+            # SRO: 1/2 + 1/2 分割
+            omega_shape_set, omega_calibration_set = generate_temperature_uncertainty_data(
+                omega_combined=omega_combined,
+                use_summer_data=True,
+                for_resro=False  # SRO模式
+            )
+            
+            # Re-SRO: 1/4 + 1/4 + 1/2 分割 (独立数据)
+            omega_sro_shape, omega_sro_calib, omega_resro_calib = generate_temperature_uncertainty_data(
+                omega_combined=omega_combined,
+                use_summer_data=True,
+                for_resro=True  # Re-SRO模式
+            )
+        else:
+            print("温度误差数据集已存在,直接加载")
+            omega_shape_set = np.load(shape_file)
+            omega_calibration_set = np.load(calib_file)
+            
+            # 加载Re-SRO的3部分数据
+            omega_sro_shape = np.load('omega_sro_shape_summer.npy')
+            omega_sro_calib = np.load('omega_sro_calib_summer.npy')
+            omega_resro_calib = np.load('omega_resro_calib_summer.npy')
         
-        # 加载温度误差数据
-        omega_combined = np.load('summer_all_errors_yesterday.npy')
-        
-        # 生成数据集 (针对SRO和Re-SRO分别准备)
-        # SRO: 1/2 + 1/2 分割
-        omega_shape_set, omega_calibration_set = generate_temperature_uncertainty_data(
-            omega_combined=omega_combined,
-            use_summer_data=True,
-            for_resro=False  # SRO模式
-        )
-        
-        # Re-SRO: 1/4 + 1/4 + 1/2 分割 (独立数据)
-        omega_sro_shape, omega_sro_calib, omega_resro_calib = generate_temperature_uncertainty_data(
-            omega_combined=omega_combined,
-            use_summer_data=True,
-            for_resro=True  # Re-SRO模式
-        )
+        print(f"SRO数据: shape={omega_shape_set.shape}, calib={omega_calibration_set.shape}")
+        print(f"Re-SRO数据: sro_shape={omega_sro_shape.shape}, sro_calib={omega_sro_calib.shape}, resro_calib={omega_resro_calib.shape}")
     else:
-        print("温度误差数据集已存在,直接加载")
-        omega_shape_set = np.load(shape_file)
-        omega_calibration_set = np.load(calib_file)
-        
-        # 加载Re-SRO的3部分数据
-        omega_sro_shape = np.load('omega_sro_shape_summer.npy')
-        omega_sro_calib = np.load('omega_sro_calib_summer.npy')
-        omega_resro_calib = np.load('omega_resro_calib_summer.npy')
-    
-    print(f"SRO数据: shape={omega_shape_set.shape}, calib={omega_calibration_set.shape}")
-    print(f"Re-SRO数据: sro_shape={omega_sro_shape.shape}, sro_calib={omega_sro_calib.shape}, resro_calib={omega_resro_calib.shape}")
+        print("\n--- 跳过不确定性数据准备 (无JCC算法启用) ---")
+        omega_shape_set = omega_calibration_set = None
+        omega_sro_shape = omega_sro_calib = omega_resro_calib = None
     
     # 3. 获取启用的算法
     ALGORITHMS = get_enabled_algorithms()
@@ -509,11 +520,16 @@ def run_advanced_comparison(num_samples, num_households, periods, num_days, num_
                 print(f"\n  --- {name}: 峰值优化 ---")
                 result_peak = run_algorithm(name, module, run_data, objective='peak')
                 
-                # 合并结果：成本值来自成本优化，峰值来自峰值优化
+                # 【修正】分别记录成本和峰值优化的时间，与传统算法保持一致
+                # 成本优化的结果
                 sample_results[f"{name}_cost_value"] = result_cost['cost_value']
                 sample_results[f"{name}_cost_time"] = result_cost['cost_time']
+                
+                # 峰值优化的结果
                 sample_results[f"{name}_peak_value"] = result_peak['peak_value']
                 sample_results[f"{name}_peak_time"] = result_peak['peak_time']
+                
+                # 总时间保持不变（兼容性）但不再用于主要统计
                 sample_results[f"{name}_total_time"] = result_cost['total_time'] + result_peak['total_time']
                 
                 # 记录约束满足情况
@@ -542,7 +558,8 @@ def run_advanced_comparison(num_samples, num_households, periods, num_days, num_
         if f'{name}_cost_value' in df.columns and f'{name}_peak_value' in df.columns:
             avg_cost = df[f'{name}_cost_value'].mean()
             avg_peak = df[f'{name}_peak_value'].mean()
-            avg_time = df[f'{name}_total_time'].mean()
+            avg_cost_time = df[f'{name}_cost_time'].mean()
+            avg_peak_time = df[f'{name}_peak_time'].mean()
             
             # 检查约束满足情况
             constraint_info = ""
@@ -552,7 +569,7 @@ def run_advanced_comparison(num_samples, num_households, periods, num_days, num_
                 if not cost_ok or not peak_ok:
                     constraint_info = " [约束违反!]"
             
-            print(f"  {name:<25} Cost={avg_cost:<10.2f} Peak={avg_peak:<10.2f} Time={avg_time:<8.3f}s{constraint_info}")
+            print(f"  {name:<25} Cost={avg_cost:<10.2f} (t={avg_cost_time:.2f}s)  Peak={avg_peak:<10.2f} (t={avg_peak_time:.2f}s){constraint_info}")
     
     calculate_and_save_upr(df, list(ALGORITHMS.keys()), "comparison_results")
 
@@ -580,7 +597,7 @@ if __name__ == "__main__":
     # 测试参数配置
     # ===================================================================
     num_samples = 1
-    num_households = 20
+    num_households = 2000
     periods = 24
     num_days = 1000
     num_tcls = num_households
@@ -594,3 +611,8 @@ if __name__ == "__main__":
         num_tcls=num_tcls, 
         t_horizon=t_horizon
     )
+
+
+
+
+
