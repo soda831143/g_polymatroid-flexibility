@@ -292,7 +292,8 @@ def optimize_cost_column_generation(aggregator_virtual, prices, P0_physical, tcl
     return u_individual_physical, u_phys_agg_opt, total_cost
 
 
-def optimize_peak_column_generation(aggregator_virtual, P0_physical, tcl_objs, T, max_iterations=200, tolerance=1e-2):
+def optimize_peak_column_generation(aggregator_virtual, P0_physical, tcl_objs, T, prices=None,
+                                   max_iterations=200, tolerance=1e-2):
     """
     使用列生成算法优化物理L-infinity目标（峰值）
     
@@ -310,6 +311,7 @@ def optimize_peak_column_generation(aggregator_virtual, P0_physical, tcl_objs, T
         P0_physical: 物理基线功率 (T,)
         tcl_objs: TCL对象列表
         T: 时间步数
+        prices: 电价向量（保留以兼容并行版本，未使用）
         max_iterations: 最大迭代次数
         tolerance: 对偶间隙容差
     

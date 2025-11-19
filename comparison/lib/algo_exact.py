@@ -70,6 +70,7 @@ def algo(data):
     
     # 3. 求解优化问题
     results = {'status': 'error: optimization failed'}
+    results['algo_time'] = pre_algo_time  # 【修复】记录预处理时间
 
     # --- Cost-Minimization ---
     opt_start_time_cost = time.time()

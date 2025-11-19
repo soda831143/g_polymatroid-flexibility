@@ -192,13 +192,13 @@ ALL_ALGORITHMS = {
 
 # 算法启用配置 - 设置为True以启用该算法
 ALGORITHM_ENABLE = {
-    'Exact Minkowski': True,       # 精确Minkowski和 (基准)
+    'Exact Minkowski': False,       # 精确Minkowski和 (基准)
     'No Flexibility': True,        # 无灵活性 (基准)
-    'Barot Outer': True,          # 传统算法
-    'Inner Homothets': True,      # 传统算法
-    'Zonotope': True,             # 传统算法
-    'Barot Inner': True,          # 传统算法
-    'Inner Affine': True,         # 传统算法
+    'Barot Outer': False,          # 传统算法
+    'Inner Homothets': False,      # 传统算法
+    'Zonotope': False,             # 传统算法
+    'Barot Inner': False,          # 传统算法
+    'Inner Affine': False,         # 传统算法
     'G-Poly-Transform-Det': True,  # 【新】确定性g-polymatroid (使用快速DP)
     'JCC-SRO': False,              # 【新】JCC-SRO (鲁棒优化)
     'JCC-Re-SRO': False            # 【新】JCC-Re-SRO (两阶段鲁棒优化)
@@ -253,7 +253,12 @@ def print_algorithm_status():
 # --- 数据生成 ---
 def run_algorithm(algo_name, algo_module, data, objective=None):
     """
-    运行单个算法
+    运行单个算法 - 使用统一的时间计量标准
+    
+    【时间计量标准】
+    - 所有算法使用外层time.time()统一计时
+    - 包含所有预处理、优化、后处理时间
+    - 确保公平对比
     
     Args:
         algo_name: 算法名称
@@ -266,55 +271,109 @@ def run_algorithm(algo_name, algo_module, data, objective=None):
     """
     obj_suffix = f" ({objective})" if objective else ""
     print(f"  运行算法: {algo_name}{obj_suffix}...")
+    
+    # 【统一时间计量】外层计时 - 包含所有开销
+    wall_clock_start = time.time()
+    
     try:
-        start_time = time.time()
-        
         # G-Polymatroid算法需要特殊处理,调用solve()并指定优化目标
         if algo_name in GPOLY_ALGOS:
             if objective is None:
                 raise ValueError(f"{algo_name} 必须指定 objective 参数")
             
             result = algo_module.solve(data, objective=objective, use_parallel=True)
-            total_time = time.time() - start_time
+            
+            # 【统一时间计量】使用外层wall-clock时间
+            wall_clock_time = time.time() - wall_clock_start
+            
             cost = result.get('total_cost', np.nan)
             peak = result.get('peak_power', np.nan)
-            comp_time = result.get('computation_time', total_time)
             constraints_ok = result.get('constraints_satisfied', True)
             
+            # 内层时间仅用于调试参考
+            inner_time = result.get('computation_time', wall_clock_time)
+            if abs(wall_clock_time - inner_time) > 0.5:
+                print(f"    [时间差异] 外层={wall_clock_time:.3f}s, 内层={inner_time:.3f}s, 差={wall_clock_time-inner_time:.3f}s")
+            
             status_str = "✓" if constraints_ok else "✗ 不可行"
-            print(f"    完成: cost={cost:.3f}, peak={peak:.3f} (t={comp_time:.3f}s) {status_str}")
+            print(f"    完成: cost={cost:.3f}, peak={peak:.3f} (t={wall_clock_time:.3f}s) {status_str}")
+            
             return {
-                'cost_value': cost, 'peak_value': peak,
-                'cost_time': comp_time, 'peak_time': comp_time,
-                'total_time': comp_time,
-                'algorithm': algo_name, 'objective': objective, 'result': result,
+                'cost_value': cost, 
+                'peak_value': peak,
+                'cost_time': wall_clock_time,  # 【统一】使用外层时间
+                'peak_time': wall_clock_time,  # 【统一】使用外层时间
+                'total_time': wall_clock_time,
+                'algorithm': algo_name, 
+                'objective': objective, 
+                'result': result,
                 'constraints_satisfied': constraints_ok
             }
         else:
             # 传统算法使用algo()接口（同时返回成本和峰值）
             result = algo_module.algo(data)
-            total_time = time.time() - start_time
+            
+            # 【统一时间计量】使用外层wall-clock时间
+            wall_clock_time = time.time() - wall_clock_start
+            
             cost = result.get('cost_value', np.nan)
             peak = result.get('peak_value', np.nan)
-            cost_time = result.get('cost_time', 0.0)
-            peak_time = result.get('peak_time', 0.0)
+            
+            # 内层时间（仅用于调试参考）
+            cost_time_inner = result.get('cost_time', 0.0)
+            peak_time_inner = result.get('peak_time', 0.0)
+            algo_time_inner = result.get('algo_time', 0.0)
+            
+            # 【关键修复】使用外层wall-clock时间作为实际运行时间
+            # 
+            # 问题：algo()一次调用返回成本和峰值两个结果，但只运行一次
+            # 解决方案：将总时间按比例分配给成本和峰值
+            #   - 如果内层时间可靠：按内层时间比例分配
+            #   - 如果内层时间缺失：平均分配
+            
+            total_inner_time = cost_time_inner + peak_time_inner + algo_time_inner
+            
+            if total_inner_time > 1e-6:  # 内层时间有效
+                # 按内层时间比例分配外层时间
+                cost_ratio = (algo_time_inner + cost_time_inner) / total_inner_time
+                peak_ratio = (algo_time_inner + peak_time_inner) / total_inner_time
+                
+                cost_time = wall_clock_time * cost_ratio
+                peak_time = wall_clock_time * peak_ratio
+                
+                # 验证时间分配
+                if abs(wall_clock_time - total_inner_time) > 1.0:
+                    print(f"    [时间校正] 外层={wall_clock_time:.3f}s, 内层={total_inner_time:.3f}s, "
+                          f"已按比例分配: cost={cost_time:.3f}s, peak={peak_time:.3f}s")
+            else:
+                # 内层时间缺失，平均分配外层时间
+                cost_time = wall_clock_time / 2
+                peak_time = wall_clock_time / 2
+                print(f"    [时间校正] 内层时间缺失，外层={wall_clock_time:.3f}s，平均分配")
+            
             print(f"    完成: cost={cost:.3f} (t={cost_time:.3f}s), peak={peak:.3f} (t={peak_time:.3f}s)")
+            
             return {
-                'cost_value': cost, 'peak_value': peak,
-                'cost_time': cost_time, 'peak_time': peak_time,
-                'algo_time': result.get('algo_time', total_time), 'total_time': total_time,
+                'cost_value': cost, 
+                'peak_value': peak,
+                'cost_time': cost_time,  # 【修复】使用外层时间（按比例分配）
+                'peak_time': peak_time,  # 【修复】使用外层时间（按比例分配）
+                'algo_time': algo_time_inner,
+                'total_time': wall_clock_time,
                 'status': 'success'
             }
+            
     except Exception as e:
+        wall_clock_time = time.time() - wall_clock_start
         print(f"    错误: {e}")
         import traceback
         traceback.print_exc()
         return {
             'cost_value': np.nan, 
             'peak_value': np.nan, 
-            'cost_time': 0.0,
-            'peak_time': 0.0,
-            'total_time': 0.0,
+            'cost_time': wall_clock_time,
+            'peak_time': wall_clock_time,
+            'total_time': wall_clock_time,
             'status': f'error: {e}'
         }
     
@@ -597,7 +656,7 @@ if __name__ == "__main__":
     # 测试参数配置
     # ===================================================================
     num_samples = 1
-    num_households = 2000
+    num_households = 100000
     periods = 24
     num_days = 1000
     num_tcls = num_households
